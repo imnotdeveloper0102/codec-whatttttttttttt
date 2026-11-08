@@ -1,0 +1,147 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -D warnings
+      - name: Tests
+        run: cargo test --workspace
+
+  # The Swift binding vendors a copy of the C header; the two must
+  # stay identical, or the Swift build silently uses a stale ABI.
+  headers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Vendored C header matches the canonical header
+        run: |
+          diff crates/codec-whatttttttttttt-c/include/codec_whatttttttttttt.h \
+            bindings/swift/Sources/CCodecWhat/codec_whatttttttttttt.h
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the C library
+        run: cargo build -p codec-whatttttttttttt-c
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install lint tools
+        run: pip install ruff mypy
+      - name: Ruff check and format
+        run: |
+          cd bindings/python
+          ruff check .
+          ruff format --check .
+      - name: Mypy
+        run: |
+          cd bindings/python
+          mypy codec_whatttttttttttt
+      - name: Tests
+        run: |
+          cd bindings/python
+          python3 -m unittest discover -s tests -v
+
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Build the WASM module
+        run: |
+          cargo build --target wasm32-unknown-unknown -p codec-whatttttttttttt-wasm --release
+          cp target/wasm32-unknown-unknown/release/codec_whatttttttttttt_wasm.wasm \
+            bindings/typescript/packages/wasm/codec_whatttttttttttt_wasm.wasm
+      - name: Install and build
+        run: |
+          cd bindings/typescript
+          npm install
+          npm run build --workspace @codec-whatttttttttttt/wasm
+          npm run build --workspace @codec-whatttttttttttt/core
+          npm run build --workspace @codec-whatttttttttttt/react-native
+      - name: Tests
+        run: |
+          cd bindings/typescript
+          npm test --workspace @codec-whatttttttttttt/core
+
+  swift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.1.2"
+      - name: Build the C library
+        run: cargo build --release -p codec-whatttttttttttt-c
+      - name: Build and test
+        run: |
+          cd bindings/swift
+          swift build
+          swift test
+
+  kotlin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Install Kotlin
+        run: sudo apt-get update && sudo apt-get install -y kotlin
+      - name: Build the C library
+        run: cargo build -p codec-whatttttttttttt-c
+      - name: Build the JNI library
+        run: |
+          export JAVA_HOME=$JAVA_HOME_17_X64
+          mkdir -p bindings/kotlin/build
+          g++ -shared -fPIC -O2 \
+            -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/linux" \
+            -I crates/codec-whatttttttttttt-c/include \
+            bindings/kotlin/src/main/cpp/jni_bridge.cpp \
+            target/debug/libcodec_whatttttttttttt.a -lm -lpthread -ldl \
+            -o bindings/kotlin/build/libcodecwhat_jni.so
+      - name: Build and test
+        run: |
+          kotlinc bindings/kotlin/src/main/kotlin bindings/kotlin/src/test/kotlin \
+            -include-runtime -d bindings/kotlin/build/codecwhat-test.jar
+          java -Djava.library.path=bindings/kotlin/build \
+            -cp bindings/kotlin/build/codecwhat-test.jar \
+            dev.codecwhat.DecoderTestKt
+
+  zig:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+      - name: Build the C library
+        run: cargo build --release -p codec-whatttttttttttt-c
+      - name: Build and test
+        run: |
+          cd bindings/zig
+          zig build test
+          zig build run -- ../../crates/codec-whatttttttttttt-core/tests/data/valid_i16_stereo_44100.wav
