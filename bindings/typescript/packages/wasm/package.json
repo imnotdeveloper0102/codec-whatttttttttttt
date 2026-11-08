@@ -1,0 +1,1 @@
+{"description":"WebAssembly loader and low-level wrapper for codec-whatttttttttttt (Phase 10)","files":["dist","codec_whatttttttttttt_wasm.wasm"],"license":"MIT OR Apache-2.0","main":"dist/index.js","name":"@codec-whatttttttttttt/wasm","scripts":{"build":"tsc -p tsconfig.json"},"type":"commonjs","types":"dist/index.d.ts","version":"0.1.0"}

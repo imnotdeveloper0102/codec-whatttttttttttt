@@ -1,0 +1,18 @@
+[package]
+name = "codec-whatttttttttttt-c"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "C ABI for codec-whatttttttttttt (Phase 10)"
+
+[lib]
+name = "codec_whatttttttttttt"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+codec-whatttttttttttt-core = { path = "../codec-whatttttttttttt-core" }
+
+[dev-dependencies]
+codec-whatttttttttttt-core = { path = "../codec-whatttttttttttt-core" }

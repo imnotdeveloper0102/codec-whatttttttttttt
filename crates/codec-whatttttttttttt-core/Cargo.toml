@@ -1,0 +1,21 @@
+[package]
+name = "codec-whatttttttttttt-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Core codec library: PCM/WAV, FLAC, Opus, Vorbis, AV1, VP9 (open formats only)"
+repository = "https://example.invalid/codec-whatttttttttttt"
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }

@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codec-whatttttttttttt"
+version = "0.1.0"
+description = "Python bindings for codec-whatttttttttttt (Phase 10)"
+license = { text = "MIT OR Apache-2.0" }
+requires-python = ">=3.9"
+
+[tool.setuptools.packages.find]
+include = ["codec_whatttttttttttt*"]
+
+[tool.ruff]
+# The binding supports Python 3.9; ruff must not introduce newer
+# syntax (e.g. parenthesised `with`) when formatting.
+target-version = "py39"

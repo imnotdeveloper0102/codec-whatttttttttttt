@@ -1,0 +1,14 @@
+.{
+    .name = .codec_whatttttttttttt_zig,
+    .version = "0.1.0",
+    .fingerprint = 0x513423851a0af4b0,
+    .minimum_zig_version = "0.14.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "README.md",
+    },
+}

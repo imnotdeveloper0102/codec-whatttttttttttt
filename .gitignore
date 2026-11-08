@@ -1,0 +1,18 @@
+/target
+Cargo.lock
+**/*.rs.bk
+.DS_Store
+
+# Build outputs and caches (generated; CI rebuilds them)
+**/target/
+node_modules/
+dist/
+.build/
+.zig-cache/
+fuzz/corpus/
+fuzz/artifacts/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+bindings/kotlin/build/
+bindings/typescript/packages/wasm/*.wasm

@@ -1,0 +1,53 @@
+[package]
+name = "codec-whatttttttttttt-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# The fuzz crate is a standalone crate (built by cargo-fuzz with
+# its own flags); this empty table keeps Cargo from treating it
+# as part of the workspace above it.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+codec-whatttttttttttt-core = { path = ".." }
+
+[[bin]]
+name = "fuzz_wav"
+path = "fuzz_targets/fuzz_wav.rs"
+
+[[bin]]
+name = "fuzz_flac"
+path = "fuzz_targets/fuzz_flac.rs"
+
+[[bin]]
+name = "fuzz_ogg"
+path = "fuzz_targets/fuzz_ogg.rs"
+
+[[bin]]
+name = "fuzz_ebml"
+path = "fuzz_targets/fuzz_ebml.rs"
+
+[[bin]]
+name = "fuzz_mp4"
+path = "fuzz_targets/fuzz_mp4.rs"
+
+[[bin]]
+name = "fuzz_av1"
+path = "fuzz_targets/fuzz_av1.rs"
+
+[[bin]]
+name = "fuzz_vp9"
+path = "fuzz_targets/fuzz_vp9.rs"
+
+[[bin]]
+name = "fuzz_opus"
+path = "fuzz_targets/fuzz_opus.rs"
+
+[[bin]]
+name = "fuzz_vorbis"
+path = "fuzz_targets/fuzz_vorbis.rs"

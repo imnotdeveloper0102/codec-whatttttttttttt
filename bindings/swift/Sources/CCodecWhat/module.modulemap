@@ -1,0 +1,4 @@
+module CCodecWhat {
+    header "codec_whatttttttttttt.h"
+    export *
+}

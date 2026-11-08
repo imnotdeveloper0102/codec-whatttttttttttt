@@ -1,0 +1,16 @@
+[package]
+name = "codec-whatttttttttttt-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Command-line tool for codec-whatttttttttttt"
+
+[[bin]]
+name = "codec-whatttttttttttt"
+path = "src/main.rs"
+
+[dependencies]
+codec-whatttttttttttt-core = { path = "../codec-whatttttttttttt-core" }
+clap.workspace = true
