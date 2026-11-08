@@ -1,0 +1,70 @@
+name: sanitizer
+
+# Fuzzing, sanitizers, and Miri (Phase 11 hardening). Runs on
+# push and weekly: the fuzz targets run 60 s each (the same bound
+# used locally), Miri runs the core's unit tests only (the full
+# suite under Miri is too slow for CI).
+on:
+  push:
+  schedule:
+    - cron: "0 3 * * 0"
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz each parser (60 s per target)
+        run: |
+          cd crates/codec-whatttttttttttt-core/fuzz
+          for target in fuzz_wav fuzz_flac fuzz_ogg fuzz_ebml fuzz_mp4 fuzz_av1 fuzz_vp9 fuzz_opus fuzz_vorbis; do
+            cargo +nightly fuzz run "$target" -- -max_total_time=60
+          done
+
+  asan-ubsan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - name: Build the C library with AddressSanitizer
+        # The sanitizer flag must be target-specific: proc-macro
+        # crates build for the host and cannot be built with
+        # sanitizers enabled, so plain RUSTFLAGS fails.
+        run: |
+          cargo +nightly build -Zbuild-std --target x86_64-unknown-linux-gnu \
+            -p codec-whatttttttttttt-c \
+            --config 'target.x86_64-unknown-linux-gnu.rustflags=["-Zsanitizer=address"]'
+      - name: Build and run the C example under ASan/UBSan
+        run: |
+          clang crates/codec-whatttttttttttt-c/examples/encode_decode.c \
+            -I crates/codec-whatttttttttttt-c/include \
+            target/x86_64-unknown-linux-gnu/debug/libcodec_whatttttttttttt.a \
+            -fsanitize=address,undefined -o /tmp/asan_example
+          # The example generates its own input; the C++ driver
+          # reads fixtures by a path relative to the workspace root,
+          # so both run from here.
+          /tmp/asan_example
+      - name: Build and run the C++ test driver under ASan/UBSan
+        run: |
+          clang++ crates/codec-whatttttttttttt-c/tests/test_cpp.cpp \
+            -I crates/codec-whatttttttttttt-c/include \
+            target/x86_64-unknown-linux-gnu/debug/libcodec_whatttttttttttt.a \
+            -fsanitize=address,undefined -o /tmp/asan_test_cpp
+          /tmp/asan_test_cpp
+
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: Miri unit tests (core)
+        run: |
+          MIRIFLAGS="-Zmiri-disable-isolation" \
+            cargo +nightly miri test -p codec-whatttttttttttt-core --lib
