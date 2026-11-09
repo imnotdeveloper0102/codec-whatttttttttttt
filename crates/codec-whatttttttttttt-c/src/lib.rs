@@ -28,6 +28,7 @@ pub const CODEC_ERR_UNSUPPORTED: i32 = 4;
 pub const CODEC_ERR_OVERFLOW: i32 = 5;
 pub const CODEC_ERR_ALLOCATION_LIMIT: i32 = 6;
 pub const CODEC_ERR_INVALID_ARGUMENT: i32 = 7;
+pub const CODEC_ERR_LICENSE_REQUIRED: i32 = 8;
 
 // Codec ids (must match codec_whatttttttttttt.h). Only the ids
 // `codec_probe` can return are needed here; Opus and Vorbis need a
@@ -80,6 +81,7 @@ fn error_code(err: &Error) -> i32 {
         Error::Overflow(_) => CODEC_ERR_OVERFLOW,
         Error::AllocationLimit { .. } => CODEC_ERR_ALLOCATION_LIMIT,
         Error::InvalidArgument(_) => CODEC_ERR_INVALID_ARGUMENT,
+        Error::LicenseRequired { .. } => CODEC_ERR_LICENSE_REQUIRED,
     }
 }
 
@@ -212,6 +214,7 @@ pub extern "C" fn codec_error_string(code: i32) -> *const std::ffi::c_char {
         CODEC_ERR_OVERFLOW => static_cstr(b"overflow\0"),
         CODEC_ERR_ALLOCATION_LIMIT => static_cstr(b"allocation limit exceeded\0"),
         CODEC_ERR_INVALID_ARGUMENT => static_cstr(b"invalid argument\0"),
+        CODEC_ERR_LICENSE_REQUIRED => static_cstr(b"license required\0"),
         _ => static_cstr(b"unknown error code\0"),
     }
 }

@@ -128,10 +128,8 @@ fn parse_fmt(
     let format = match (tag, bits) {
         (1, 16) => PcmFormat::I16,
         (1, 24) => PcmFormat::I24,
+        (1, 32) => PcmFormat::I32,
         (3, 32) => PcmFormat::F32,
-        (1, 32) => {
-            return Err(Error::Unsupported("32-bit integer pcm"));
-        }
         _ => {
             return Err(Error::Unsupported("wav format tag or bit depth"));
         }

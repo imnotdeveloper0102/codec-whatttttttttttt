@@ -16,6 +16,7 @@ ERR_UNSUPPORTED: int
 ERR_OVERFLOW: int
 ERR_ALLOCATION_LIMIT: int
 ERR_INVALID_ARGUMENT: int
+ERR_LICENSE_REQUIRED: int
 
 # Codec ids (must match codec_whatttttttttttt.h).
 CODEC_UNKNOWN: int

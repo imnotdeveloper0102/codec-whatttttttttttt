@@ -9,6 +9,12 @@
 //! integer samples exactly; the only loss is that f32 1.0 encodes to
 //! the largest positive integer (32767 / 8388607) instead of
 //! overflowing, because 32768 itself is not representable in i16.
+//!
+//! The f32 pipeline cannot carry 32-bit integers bit-exactly: f32 has
+//! a 24-bit significand, so the low bits of an i32 sample do not
+//! survive a round trip through f32. Callers that need the lossless
+//! bit-exact path use `decode_i32_samples` / `encode_i32_samples`,
+//! which move i32 samples without passing through f32.
 
 use crate::error::{Error, Result};
 use crate::limits::{MAX_CHANNELS, MAX_FRAME_SAMPLES};
@@ -20,6 +26,8 @@ pub enum PcmFormat {
     I16,
     /// Signed 24-bit little-endian, stored as 3 bytes per sample.
     I24,
+    /// Signed 32-bit little-endian, the WAV format tag 1, 32-bit form.
+    I32,
     /// 32-bit float little-endian, the WAV format tag 3 format.
     F32,
 }
@@ -31,7 +39,7 @@ impl PcmFormat {
         match self {
             Self::I16 => 2,
             Self::I24 => 3,
-            Self::F32 => 4,
+            Self::I32 | Self::F32 => 4,
         }
     }
 
@@ -39,7 +47,7 @@ impl PcmFormat {
     #[must_use]
     pub fn wav_format_tag(self) -> u16 {
         match self {
-            Self::I16 | Self::I24 => 1,
+            Self::I16 | Self::I24 | Self::I32 => 1,
             Self::F32 => 3,
         }
     }
@@ -50,7 +58,7 @@ impl PcmFormat {
         match self {
             Self::I16 => 16,
             Self::I24 => 24,
-            Self::F32 => 32,
+            Self::I32 | Self::F32 => 32,
         }
     }
 }
@@ -110,6 +118,12 @@ pub fn decode_samples(bytes: &[u8], format: PcmFormat, channels: u32) -> Result<
                 samples.push(value as f32 / 8_388_608.0);
             }
         }
+        PcmFormat::I32 => {
+            for chunk in bytes.chunks_exact(4) {
+                let value = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                samples.push(value as f32 / 2_147_483_648.0);
+            }
+        }
         PcmFormat::F32 => {
             for chunk in bytes.chunks_exact(4) {
                 samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
@@ -159,11 +173,91 @@ pub fn encode_samples(samples: &[f32], format: PcmFormat, channels: u32) -> Resu
                 out.extend_from_slice(&value.to_le_bytes()[..3]);
             }
         }
+        PcmFormat::I32 => {
+            for &sample in samples {
+                let clamped = sample.clamp(-1.0, 1.0);
+                // i64 holds the scaled value: 1.0 scales to 2^31, one
+                // past i32::MAX, so the saturating step below needs it.
+                let value = (clamped * 2_147_483_648.0).round() as i64;
+                let value = value.clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+                out.extend_from_slice(&i32::try_from(value).unwrap_or(i32::MAX).to_le_bytes());
+            }
+        }
         PcmFormat::F32 => {
             for &sample in samples {
                 out.extend_from_slice(&sample.to_le_bytes());
             }
         }
+    }
+    Ok(out)
+}
+
+/// Decodes interleaved 32-bit integer PCM bytes to interleaved i32
+/// samples, without passing through f32.
+///
+/// The f32 pipeline rounds every i32 value to 24 significant bits,
+/// so a lossless path that must preserve the low bits uses this
+/// function instead of `decode_samples` with `PcmFormat::I32`.
+///
+/// # Errors
+///
+/// Returns `InvalidData` when `bytes` is not a whole number of
+/// samples for `channels`, `InvalidArgument` when `channels` is zero
+/// or above the limit, and `AllocationLimit` when the sample count
+/// exceeds the per-call allocation limit.
+pub fn decode_i32_samples(bytes: &[u8], channels: u32) -> Result<Vec<i32>> {
+    if channels == 0 || channels > MAX_CHANNELS {
+        return Err(Error::InvalidArgument(
+            "pcm channel count must be between 1 and 8",
+        ));
+    }
+    if bytes.len() % 4 != 0 {
+        return Err(Error::InvalidData {
+            offset: bytes.len(),
+            detail: "pcm data is not a whole number of samples",
+        });
+    }
+    let sample_count = bytes.len() / 4;
+    if sample_count > MAX_FRAME_SAMPLES {
+        return Err(Error::AllocationLimit {
+            requested: sample_count * 4,
+            limit: MAX_FRAME_SAMPLES * 4,
+        });
+    }
+    if sample_count % channels as usize != 0 {
+        return Err(Error::InvalidData {
+            offset: bytes.len(),
+            detail: "pcm sample count is not a whole number of frames",
+        });
+    }
+    let mut samples = Vec::with_capacity(sample_count);
+    for chunk in bytes.chunks_exact(4) {
+        samples.push(i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Ok(samples)
+}
+
+/// Encodes interleaved i32 samples to interleaved 32-bit integer PCM
+/// bytes, exactly; the inverse of `decode_i32_samples`.
+///
+/// # Errors
+///
+/// Returns `InvalidArgument` when `channels` is zero or above the
+/// limit, or when the sample count is not a whole number of frames.
+pub fn encode_i32_samples(samples: &[i32], channels: u32) -> Result<Vec<u8>> {
+    if channels == 0 || channels > MAX_CHANNELS {
+        return Err(Error::InvalidArgument(
+            "pcm channel count must be between 1 and 8",
+        ));
+    }
+    if samples.len() % channels as usize != 0 {
+        return Err(Error::InvalidArgument(
+            "pcm sample count is not a whole number of frames",
+        ));
+    }
+    let mut out = Vec::with_capacity(samples.len() * 4);
+    for &sample in samples {
+        out.extend_from_slice(&sample.to_le_bytes());
     }
     Ok(out)
 }
@@ -196,6 +290,24 @@ mod tests {
         let decoded = decode_samples(&bytes, PcmFormat::I24, 1).unwrap();
         for (a, b) in original.iter().zip(decoded.iter()) {
             assert!((a - b).abs() < 1.0 / 8_388_608.0 + f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn i32_round_trip_is_bit_exact() {
+        let original = vec![0, 1, -1, 123_456_789, -987_654_321, i32::MIN, i32::MAX];
+        let bytes = encode_i32_samples(&original, 1).unwrap();
+        assert_eq!(decode_i32_samples(&bytes, 1).unwrap(), original);
+    }
+
+    #[test]
+    fn i32_through_f32_keeps_representable_values() {
+        // Multiples of 256 fit in the 24-bit f32 significand exactly.
+        let original = vec![0.0, 0.5, -0.25, 256.0 / 2_147_483_648.0];
+        let bytes = encode_samples(&original, PcmFormat::I32, 1).unwrap();
+        let decoded = decode_samples(&bytes, PcmFormat::I32, 1).unwrap();
+        for (a, b) in original.iter().zip(decoded.iter()) {
+            assert!((a - b).abs() < 1e-9);
         }
     }
 

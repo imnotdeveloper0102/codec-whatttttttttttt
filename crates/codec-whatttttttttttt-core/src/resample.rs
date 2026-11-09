@@ -10,6 +10,20 @@
 use crate::error::{Error, Result};
 use crate::frame::AudioFrame;
 use crate::limits::{MAX_ALLOCATION_BYTES, MAX_SAMPLE_RATE};
+use crate::polyphase::resample_polyphase;
+
+/// Resampling method. `Linear` is the Phase 1 interpolator:
+/// cheap, honest about its error. `Polyphase` is the
+/// windowed-sinc filterbank in `polyphase.rs`: the quality path
+/// for rate changes where interpolation error is audible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ResampleMethod {
+    /// Linear interpolation (the historical default).
+    #[default]
+    Linear,
+    /// Windowed-sinc polyphase FIR resampling.
+    Polyphase,
+}
 
 /// Resamples `input` to `target_sample_rate` with linear interpolation.
 ///
@@ -29,6 +43,39 @@ use crate::limits::{MAX_ALLOCATION_BYTES, MAX_SAMPLE_RATE};
     reason = "positions stay in [0, frame_count) with frame_count below 2^24, so they are exact in f64 and non-negative; the fraction-to-f32 rounding is the sample format's own precision"
 )]
 pub fn resample(input: &AudioFrame, target_sample_rate: u32) -> Result<AudioFrame> {
+    resample_with_method(input, target_sample_rate, ResampleMethod::Linear)
+}
+
+/// Resamples `input` to `target_sample_rate` with the given method.
+///
+/// `Linear` interpolates; `Polyphase` runs the windowed-sinc
+/// filterbank. Both validate rates and channels the same way and
+/// return the input unchanged when the rates are equal.
+///
+/// # Errors
+///
+/// Returns `InvalidArgument` when either rate is zero or the
+/// channel count is zero, `Overflow` when the target rate exceeds
+/// `MAX_SAMPLE_RATE`, and `AllocationLimit` when the output would
+/// exceed the per-call limit.
+pub fn resample_with_method(
+    input: &AudioFrame,
+    target_sample_rate: u32,
+    method: ResampleMethod,
+) -> Result<AudioFrame> {
+    match method {
+        ResampleMethod::Linear => resample_linear(input, target_sample_rate),
+        ResampleMethod::Polyphase => resample_polyphase(input, target_sample_rate),
+    }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "positions stay in [0, frame_count) with frame_count below 2^24, so they are exact in f64 and non-negative; the fraction-to-f32 rounding is the sample format's own precision"
+)]
+fn resample_linear(input: &AudioFrame, target_sample_rate: u32) -> Result<AudioFrame> {
     if input.sample_rate == 0 {
         return Err(Error::InvalidArgument(
             "source sample rate must be positive",

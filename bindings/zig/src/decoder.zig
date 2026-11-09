@@ -19,6 +19,7 @@ pub const Error = error{
     Overflow,
     AllocationLimit,
     InvalidArgument,
+    LicenseRequired,
     OutOfMemory,
 };
 
@@ -32,6 +33,7 @@ fn check(rc: c_int) Error!void {
         c.CODEC_ERR_OVERFLOW => Error.Overflow,
         c.CODEC_ERR_ALLOCATION_LIMIT => Error.AllocationLimit,
         c.CODEC_ERR_INVALID_ARGUMENT => Error.InvalidArgument,
+        c.CODEC_ERR_LICENSE_REQUIRED => Error.LicenseRequired,
         else => Error.InvalidArgument,
     };
 }

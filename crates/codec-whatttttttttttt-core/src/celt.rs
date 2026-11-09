@@ -1,20 +1,16 @@
 //! CELT layer frame-header decode (RFC 6716 sections 4.3, 4.3.1,
 //! 4.3.7.1, 4.3.7.2, 4.4).
 //!
-//! Subset implemented in this phase: the CELT frame header symbols
-//! only (silence, post-filter, transient, intra), in the order of
-//! Table 56. Sample reconstruction (coarse and fine energy, bit
-//! allocation, PVQ shape decode, inverse MDCT, post-filter,
-//! de-emphasis) is NOT implemented: the CELT allocation and PVQ
-//! tables (`e_prob_model`, `cache_caps50`, `celt_pulse_cache`,
-//! spread tables) exist only inside the reference C source, which
-//! RFC 6716 Appendix A ships as a base64-encoded gzipped tarball
-//! that cannot be extracted from the specification text. Porting
-//! them from the reference source is follow-up work; until then
-//! `decode_celt_frame_header` returns `Unsupported` naming the
-//! unimplemented remainder after the header symbols, and the
-//! `Decoder` integration reports the same. Nothing here fabricates
-//! audio samples.
+//! This module decodes the CELT frame header symbols only
+//! (silence, post-filter, transient, intra), in the order of
+//! Table 56. The full CELT sample reconstruction (coarse and fine
+//! energy, bit allocation, PVQ shape decode, inverse MDCT,
+//! post-filter, de-emphasis) lives in `celt_reconstruct.rs`
+//! (`CeltDecoder`); this module's `decode_celt_frame_header`
+//! stays a header-only API and still returns `Unsupported` for a
+//! non-silence frame, so callers that only need the header do not
+//! pay for the reconstruction. The shared symbol decode is
+//! `decode_celt_frame_header_from`, used by both.
 //!
 //! Packet loss concealment is an explicit API, `conceal_loss()`,
 //! returning a silence frame of the last frame's duration. The
@@ -22,8 +18,8 @@
 //! (RFC 6716 section 4.4); silence is the honest subset of that
 //! until the full CELT decoder exists.
 
+use crate::celt_reconstruct::CeltRangeReader;
 use crate::error::{Error, Result};
-use crate::range_decoder::RangeDecoder;
 
 /// Post-filter parameters (RFC 6716 section 4.3.7.1), decoded when
 /// the post-filter flag is set.
@@ -71,21 +67,53 @@ pub struct CeltFrameHeader {
 /// frame (RFC 6716 section 4.3, Table 56 order: silence,
 /// post-filter, transient, intra), then stops.
 ///
-/// The remaining CELT decode (coarse and fine energy, bit
-/// allocation, PVQ, inverse MDCT, post-filter, de-emphasis) is not
-/// implemented in this phase, so after the header symbols this
-/// function returns `Unsupported` naming that remainder — unless the
-/// frame is silence, which decodes fully to zeros and returns the
-/// header with no error.
+/// This is the header-only API: after the header symbols it
+/// returns `Unsupported` naming the sample reconstruction, unless
+/// the frame is silence, which decodes fully to zeros and returns
+/// the header with no error. The full reconstruction is
+/// `CeltDecoder::decode_frame` in `celt_reconstruct.rs`, which
+/// reuses `decode_celt_frame_header_from` below and continues past
+/// the header.
 ///
 /// # Errors
 ///
 /// Returns `Unsupported` for a non-silence CELT frame (sample
-/// reconstruction not implemented), and `InvalidData` when the
-/// range decoder reports a corrupt symbol (for example a
-/// post-filter octave at or above 6).
+/// reconstruction lives in `celt_reconstruct.rs`, not here), and
+/// `InvalidData` when the range decoder reports a corrupt symbol
+/// (for example a post-filter octave at or above 6).
 pub fn decode_celt_frame_header(frame: &[u8]) -> Result<CeltFrameHeader> {
-    let mut decoder = RangeDecoder::new(frame);
+    let mut decoder = CeltRangeReader::new(frame);
+    let header = decode_celt_frame_header_from(&mut decoder)?;
+    if header.silence {
+        return Ok(header);
+    }
+    Err(Error::Unsupported(
+        "CELT sample reconstruction lives in celt_reconstruct::CeltDecoder; decode_celt_frame_header decodes the header only",
+    ))
+}
+
+/// Decodes the CELT frame header symbols from a live range
+/// decoder (RFC 6716 section 4.3, Table 56 order), returning the
+/// header for silence and non-silence alike. Shared by
+/// `decode_celt_frame_header` and by the full reconstruction in
+/// `celt_reconstruct.rs`, which keeps the decoder positioned just
+/// past the header symbols.
+///
+/// The reference (`celt_decode_with_ec`) guards the post-filter,
+/// transient and intra symbols with `tell + 16/3 <= total_bits`,
+/// so a frame too short to hold them skips them; this helper
+/// decodes them unconditionally, matching the previous behaviour
+/// of this module. That only differs on frames too short to be a
+/// valid non-silence CELT frame (a valid one is tens of bytes or
+/// more); the full decoder still fails cleanly on such a frame.
+///
+/// # Errors
+///
+/// Returns `InvalidData` when the range decoder reports a corrupt
+/// symbol.
+pub(crate) fn decode_celt_frame_header_from(
+    decoder: &mut CeltRangeReader,
+) -> Result<CeltFrameHeader> {
     // Silence flag: PDF {32767, 1}/32768 (section 4.3, Table 56).
     let silence = decoder.decode_bit_logp(15)?;
     if silence {
@@ -122,15 +150,12 @@ pub fn decode_celt_frame_header(frame: &[u8]) -> Result<CeltFrameHeader> {
     let transient = decoder.decode_bit_logp(3)?;
     // Intra flag: PDF {7, 1}/8.
     let intra = decoder.decode_bit_logp(3)?;
-    let _ = CeltFrameHeader {
+    Ok(CeltFrameHeader {
         silence: false,
         post_filter,
         transient,
         intra,
-    };
-    Err(Error::Unsupported(
-        "CELT sample reconstruction (energy, bit allocation, PVQ, inverse MDCT) is not implemented in this phase; CELT tables live only in the RFC 6716 Appendix A reference source",
-    ))
+    })
 }
 
 /// Explicit packet loss concealment (RFC 6716 section 4.4).

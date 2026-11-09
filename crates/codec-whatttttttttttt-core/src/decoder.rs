@@ -2,15 +2,19 @@
 //!
 //! Phase 1 decodes `Codec::Pcm`; Phase 2 adds `Codec::Flac`.
 //! Phase 4 adds `Codec::Opus` (CELT silence frames as silence;
-//! CELT sample reconstruction and SILK return `Unsupported`
-//! naming the unimplemented part) and Phase 5 adds
-//! `Codec::Vorbis`. Phase 7 adds `Codec::Av1` as parser-only:
-//! `Decoder::from_av1_sequence_header` validates the subset and
-//! `decode` returns `Unsupported` for reconstruction until tile
-//! decoding exists with passing tests. Phase 8 adds `Codec::Vp9`
-//! the same way: `Decoder::from_vp9_frame_header` validates the
-//! subset (profile 0, 8-bit, YUV 4:2:0, no RGB) and `decode`
-//! returns `Unsupported` until tile decoding exists. Every other
+//! SILK returns `Unsupported` naming the unimplemented part)
+//! and Phase 5 adds `Codec::Vorbis`. Phase 7 adds `Codec::Av1`
+//! as parser-only; the current round wires tile decode and
+//! intra reconstruction, which today returns `Unsupported`
+//! naming the missing coefficient CDF tables, so no pixels
+//! exist yet. Phase 8 adds `Codec::Vp9` the same way; the
+//! current round wires reconstruction, which decodes keyframes
+//! bit-exactly and returns `Unsupported` for inter frames
+//! until motion compensation is pixel-correct. The current
+//! round adds `Codec::Alac` (`Decoder::from_alac_config`, no
+//! license needed) and `Codec::Aac` (`Decoder::from_aac_config`,
+//! licensed-aac feature plus a validated `LicenseContext`).
+//! Every other
 //! codec returns `Unsupported` naming the codec, so a caller can
 //! tell "not built yet" apart from "corrupt input". PCM decoding
 //! needs a format: it comes from a WAV header via
@@ -25,21 +29,31 @@
 //! extension that makes PCM decoding possible, recorded in
 //! `docs/DESIGN.md` section 12.
 
+use crate::aac_frame::{AacConfig, AacDecoder};
+use crate::alac_frame::{decode_alac_audio_frame, AlacConfig};
 use crate::av1_frame::Av1ReferenceState;
-use crate::av1_sequence::SequenceHeader;
+use crate::av1_obu::{ObuReader, ObuType};
+use crate::av1_reconstruct::reconstruct_av1_frame_obu;
+use crate::av1_sequence::{parse_sequence_header, SequenceHeader};
 use crate::celt::{conceal_loss as celt_conceal_loss, decode_celt_frame_header};
+use crate::celt_reconstruct::{celt_end_band, CeltDecoder};
+use crate::dsd_decimator::DsdDecimator;
+use crate::dsd_stream::DsdHeader;
 use crate::error::{Error, Result};
 use crate::flac_frame::{decode_flac_frame, StreamInfo};
-use crate::frame::{AudioFrame, Codec, Frame, Metadata, Packet};
+use crate::frame::{AudioFrame, Codec, Frame, Metadata, Packet, VideoFrame};
+use crate::license::LicenseContext;
 use crate::limits::{
     MAX_AUDIO_PACKET_BYTES, MAX_CHANNELS, MAX_HEIGHT, MAX_SAMPLE_RATE, MAX_VIDEO_PACKET_BYTES,
     MAX_WIDTH,
 };
+use crate::mp3_frame::Mp3Decoder;
 use crate::opus_packet::{parse_opus_packet, OpusHead, OpusMode};
 use crate::pcm::{decode_samples, PcmFormat};
 use crate::vorbis_packet::VorbisPacketDecoder;
 use crate::vorbis_setup::VorbisSetup;
-use crate::vp9_bitstream::{Vp9FrameHeader, Vp9ReferenceState};
+use crate::vp9_bitstream::{parse_superframe, parse_vp9_frame, Vp9FrameHeader, Vp9ReferenceState};
+use crate::vp9_reconstruct::{reconstruct_vp9_frame, Vp9ReconstructionState};
 use crate::wav_header::WavHeader;
 
 /// Opus is always decoded at this internal sample rate (RFC 6716
@@ -67,6 +81,12 @@ pub struct DecoderConfig {
     pub pcm_channels: Option<u32>,
     /// PCM sample rate in Hz, required when `codec` is `Pcm`.
     pub pcm_sample_rate: Option<u32>,
+    /// DSD output rate in Hz, optional when `codec` is `Dsd`.
+    /// When `None`, `from_dsd_header` uses the DSD rate / 16
+    /// (176.4 kHz for DSD64). Must be a 44.1 kHz-family rate
+    /// (44.1/88.2/176.4/352.8/705.6 kHz) or a 48 kHz-family
+    /// rate (48/96/192 kHz); the decimator validates it.
+    pub dsd_output_rate: Option<u32>,
 }
 
 impl Default for DecoderConfig {
@@ -81,6 +101,7 @@ impl Default for DecoderConfig {
             pcm_format: None,
             pcm_channels: None,
             pcm_sample_rate: None,
+            dsd_output_rate: None,
         }
     }
 }
@@ -102,6 +123,28 @@ pub struct Decoder {
     vp9_header: Option<Vp9FrameHeader>,
     /// VP9 reference state, carried across frames.
     vp9_state: Vp9ReferenceState,
+    /// VP9 reconstruction state, carried across frames (saved
+    /// probability contexts, reference frame store, previous
+    /// mode maps). Owned by the VP9 pipeline in `vp9_reconstruct`.
+    vp9_recon_state: Vp9ReconstructionState,
+    /// Stateful CELT decoder, built in `from_opus_head` once
+    /// the channel count is known; carried across packets.
+    celt: Option<CeltDecoder>,
+    /// DSD header, when the decoder was built from one.
+    dsd_header: Option<DsdHeader>,
+    /// DSD decimator, holding the filter state across packets.
+    dsd_decimator: Option<DsdDecimator>,
+    /// ALAC magic cookie, when the decoder was built from one.
+    alac_config: Option<AlacConfig>,
+    /// AAC configuration, when the decoder was built from one.
+    aac_config: Option<AacConfig>,
+    /// Stateful AAC spectral decoder (overlap buffers and
+    /// previous window shapes), built with the config above.
+    aac: Option<AacDecoder>,
+    /// True when an AAC decoder was built with a validated
+    /// license (see `from_aac_config`); `decode` refuses AAC
+    /// packets otherwise.
+    aac_licensed: bool,
     /// Duration of one frame of the last decoded Opus packet, in
     /// 48 kHz samples; 0 before the first packet.
     opus_last_frame_duration_samples: u32,
@@ -112,6 +155,10 @@ pub struct Decoder {
     /// Vorbis packet; 0 before the first packet.
     vorbis_last_granule: u64,
     vorbis: Option<VorbisPacketDecoder>,
+    /// MP3 Layer III state (bit reservoir, IMDCT overlap,
+    /// polyphase history), created lazily on the first frame:
+    /// MP3 is self-describing, so no setup is needed.
+    mp3: Option<Mp3Decoder>,
 }
 
 impl Decoder {
@@ -159,10 +206,19 @@ impl Decoder {
             av1_state: Av1ReferenceState::default(),
             vp9_header: None,
             vp9_state: Vp9ReferenceState::default(),
+            vp9_recon_state: Vp9ReconstructionState::new(),
+            celt: None,
             opus_last_frame_duration_samples: 0,
             opus_last_granule: 0,
             vorbis_last_granule: 0,
             vorbis: None,
+            mp3: None,
+            dsd_header: None,
+            dsd_decimator: None,
+            alac_config: None,
+            aac_config: None,
+            aac: None,
+            aac_licensed: false,
         })
     }
 
@@ -221,6 +277,7 @@ impl Decoder {
             ));
         }
         decoder.opus_head = Some(head.clone());
+        decoder.celt = Some(CeltDecoder::new(usize::from(head.channels))?);
         decoder.opus_pre_skip_remaining = usize::from(head.pre_skip);
         Ok(decoder)
     }
@@ -251,17 +308,18 @@ impl Decoder {
         Ok(decoder)
     }
 
-    /// Creates an AV1 decoder from a parsed sequence header. Phase
-    /// 7 is parser-only: the header is validated against the subset
-    /// (profile 0, 8-bit, YUV 4:2:0, no film grain) and `decode`
-    /// returns `Unsupported` for reconstruction until tile decoding
-    /// exists with passing tests.
+    /// Creates an AV1 decoder from a parsed sequence header. The
+    /// header is validated against the subset (profile 0, 8-bit,
+    /// YUV 4:2:0, no film grain); `decode` runs the
+    /// reconstruction pipeline, which today returns
+    /// `Unsupported` naming the missing coefficient CDF tables
+    /// (no pixels yet) and gates inter frames the same way.
     ///
     /// # Errors
     ///
     /// Returns the same validation errors as `Decoder::new`, and
     /// `Unsupported` or `Overflow` when the sequence header is
-    /// outside the Phase 7 subset.
+    /// outside the subset.
     pub fn from_av1_sequence_header(header: &SequenceHeader) -> Result<Self> {
         header.validate_subset()?;
         let mut decoder = Self::new(DecoderConfig {
@@ -273,17 +331,18 @@ impl Decoder {
         Ok(decoder)
     }
 
-    /// Creates a VP9 decoder from a parsed frame header. Phase 8
-    /// is parser-only: the header is validated against the subset
-    /// (profile 0, 8-bit, YUV 4:2:0, no RGB) and `decode` returns
-    /// `Unsupported` for reconstruction until tile decoding exists
-    /// with passing tests.
+    /// Creates a VP9 decoder from a parsed frame header. The
+    /// header is validated against the subset (profile 0, 8-bit,
+    /// YUV 4:2:0, no RGB); `decode` runs reconstruction, which
+    /// decodes keyframes bit-exactly and returns `Unsupported`
+    /// for inter frames until motion compensation is
+    /// pixel-correct.
     ///
     /// # Errors
     ///
     /// Returns the same validation errors as `Decoder::new`, and
     /// `Unsupported` or `InvalidArgument` when the frame header is
-    /// outside the Phase 8 subset.
+    /// outside the subset.
     pub fn from_vp9_frame_header(header: &Vp9FrameHeader) -> Result<Self> {
         header.validate_subset()?;
         let mut decoder = Self::new(DecoderConfig {
@@ -292,6 +351,139 @@ impl Decoder {
             ..DecoderConfig::default()
         })?;
         decoder.vp9_header = Some(header.clone());
+        Ok(decoder)
+    }
+
+    /// Creates a DSD decoder from a parsed DSF/DFF header. The
+    /// default output rate is the DSD rate / 16 (176.4 kHz for
+    /// DSD64, 352.8 kHz for DSD128); use
+    /// `with_dsd_output_rate` to pick another rate from the
+    /// 44.1 kHz or 48 kHz family before decoding. The decimator
+    /// holds filter state across packets, so one decoder decodes
+    /// one stream; `flush` returns the filter tail.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as `Decoder::new`, and
+    /// `InvalidArgument` when the channel count exceeds the
+    /// decoder limit.
+    pub fn from_dsd_header(header: &DsdHeader) -> Result<Self> {
+        let mut decoder = Self::new(DecoderConfig {
+            codec: Codec::Dsd,
+            ..DecoderConfig::default()
+        })?;
+        if header.channels > decoder.config.max_channels {
+            return Err(Error::InvalidArgument(
+                "dsd channel count exceeds decoder limit",
+            ));
+        }
+        let target_rate = header.sample_rate / 16;
+        let decimator = DsdDecimator::new(
+            header.sample_rate,
+            header.channels,
+            target_rate,
+            header.layout(),
+        )?;
+        decoder.dsd_header = Some(header.clone());
+        decoder.dsd_decimator = Some(decimator);
+        Ok(decoder)
+    }
+
+    /// Changes the DSD output rate. Only valid before the first
+    /// `decode` call on a DSD decoder: it rebuilds the
+    /// decimator, discarding its filter state.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidArgument` when this is not a DSD decoder
+    /// or the rate is outside the supported families.
+    pub fn with_dsd_output_rate(mut self, target_rate: u32) -> Result<Self> {
+        let header = self.dsd_header.clone().ok_or(Error::InvalidArgument(
+            "dsd output rate requires a decoder built from a dsd header",
+        ))?;
+        let decimator = DsdDecimator::new(
+            header.sample_rate,
+            header.channels,
+            target_rate,
+            header.layout(),
+        )?;
+        self.config.dsd_output_rate = Some(target_rate);
+        self.dsd_decimator = Some(decimator);
+        Ok(self)
+    }
+
+    /// Creates an ALAC decoder from a parsed magic cookie
+    /// (`AlacConfig`, from `parse_alac_config`). ALAC is open
+    /// (Apple reference implementation, Apache-2.0), so no
+    /// license is needed. One decoder decodes one stream; ALAC
+    /// frames carry no cross-frame state.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as `Decoder::new`, and
+    /// `InvalidArgument` when the channel count exceeds the
+    /// decoder limit.
+    pub fn from_alac_config(config: &AlacConfig) -> Result<Self> {
+        let mut decoder = Self::new(DecoderConfig {
+            codec: Codec::Alac,
+            ..DecoderConfig::default()
+        })?;
+        if config.channels > decoder.config.max_channels {
+            return Err(Error::InvalidArgument(
+                "alac channel count exceeds decoder limit",
+            ));
+        }
+        decoder.alac_config = Some(*config);
+        Ok(decoder)
+    }
+
+    /// Creates an AAC-LC decoder from a parsed configuration
+    /// (`AacConfig`, from `parse_adts_header` or
+    /// `parse_audio_specific_config`). AAC is licensed: the
+    /// `licensed-aac` feature must be compiled in and a valid
+    /// `LicenseContext` must be presented. The license is
+    /// validated (and audited) here, at construction; `decode`
+    /// then runs without re-validating, and a decoder built
+    /// without a license refuses every packet.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Unsupported` when the `licensed-aac` feature is
+    /// off, `LicenseRequired` when no license is presented or
+    /// it has expired, `InvalidArgument` for a malformed
+    /// license or a channel count above the decoder limit, and
+    /// the same validation errors as `Decoder::new`.
+    pub fn from_aac_config(
+        config: &AacConfig,
+        license: Option<&mut LicenseContext>,
+    ) -> Result<Self> {
+        if !crate::hw::licensed_feature_enabled(Codec::Aac) {
+            return Err(Error::Unsupported(
+                "aac decode requires the licensed-aac feature; rebuild with --features licensed-aac",
+            ));
+        }
+        let Some(license) = license else {
+            return Err(Error::LicenseRequired { codec: "aac" });
+        };
+        license.validate("aac")?;
+        let mut decoder = Self::new(DecoderConfig {
+            codec: Codec::Aac,
+            ..DecoderConfig::default()
+        })?;
+        if config.channels > decoder.config.max_channels {
+            return Err(Error::InvalidArgument(
+                "aac channel count exceeds decoder limit",
+            ));
+        }
+        if config.sample_rate > decoder.config.max_sample_rate {
+            return Err(Error::Overflow("aac sample rate exceeds maximum"));
+        }
+        decoder.aac_config = Some(*config);
+        // Validates the config for the spectral decoder too:
+        // 7350 Hz, an unknown rate and a bad frame length fail
+        // here, before any packet is decoded.
+        decoder.aac = Some(AacDecoder::new(config)?);
+        decoder.aac_licensed = true;
         Ok(decoder)
     }
 
@@ -320,6 +512,17 @@ impl Decoder {
         }
         if &data[0..4] == b"fLaC" {
             return Ok(Codec::Flac);
+        }
+        if &data[0..4] == b"DSD " {
+            return Ok(Codec::Dsd);
+        }
+        if &data[0..4] == b"FRM8" {
+            if data.len() >= 12 && &data[8..12] == b"DSD " {
+                return Ok(Codec::Dsd);
+            }
+            return Err(Error::Unsupported(
+                "dff container: use DsdDemuxer to identify the stream",
+            ));
         }
         if &data[0..4] == b"OggS" {
             return Err(Error::Unsupported(
@@ -370,14 +573,16 @@ impl Decoder {
     /// # Errors
     ///
     /// Returns `Unsupported` for a codec not implemented yet (SILK
-    /// Opus, CELT sample reconstruction, Vorbis floor type 0),
-    /// `AllocationLimit` when the packet exceeds `max_frame_bytes`,
-    /// `InvalidArgument` when a PCM packet arrives without a
-    /// configured format, a FLAC packet arrives without a STREAMINFO
-    /// block, an Opus packet arrives without an `OpusHead`, or a
-    /// Vorbis packet arrives without a setup, and `InvalidData` for
-    /// frame-unaligned PCM bytes, a corrupt FLAC frame, a malformed
-    /// Opus packet, or a corrupt Vorbis packet.
+    /// Opus; AV1 coefficient decode, whose CDF tables are still
+    /// missing; VP9 inter frames, whose motion compensation is
+    /// not yet pixel-correct), `AllocationLimit` when the packet
+    /// exceeds `max_frame_bytes`, `InvalidArgument` when a PCM
+    /// packet arrives without a configured format, a FLAC packet
+    /// arrives without a STREAMINFO block, an Opus packet arrives
+    /// without an `OpusHead`, or a Vorbis packet arrives without
+    /// a setup, and `InvalidData` for frame-unaligned PCM bytes,
+    /// a corrupt FLAC frame, a malformed Opus packet, or a corrupt
+    /// Vorbis packet.
     pub fn decode(&mut self, packet: &Packet) -> Result<Frame> {
         if packet.codec != self.config.codec {
             return Err(Error::InvalidArgument(
@@ -425,13 +630,204 @@ impl Decoder {
             }
             Codec::Opus => self.decode_opus(packet),
             Codec::Vorbis => self.decode_vorbis(packet),
-            Codec::Av1 => Err(Error::Unsupported(
-                "av1 reconstruction is not implemented in phase 7 (parser-only; use parse_frame_obu for the header and tile framing)",
-            )),
-            Codec::Vp9 => Err(Error::Unsupported(
-                "vp9 reconstruction is not implemented in phase 8 (parser-only; use parse_vp9_frame for the header and tile framing)",
-            )),
+            Codec::Mp3 => self.decode_mp3(packet),
+            Codec::Dsd => self.decode_dsd(packet),
+            Codec::Alac => self.decode_alac(packet),
+            Codec::Aac => {
+                // AAC-LC software decode exists, but only behind
+                // the license gate: a decoder built by
+                // `from_aac_config` with a validated license sets
+                // `aac_licensed`; any other construction (including
+                // `Decoder::new` with codec Aac) reaches here
+                // unlicensed, so the answer is the gate error:
+                // `Unsupported` when the feature is off,
+                // `LicenseRequired` when it is on.
+                if !self.aac_licensed {
+                    return Err(crate::hw::licensed_software_path_error(Codec::Aac));
+                }
+                self.decode_aac(packet)
+            }
+            Codec::Av1 => self.decode_av1(packet),
+            Codec::Vp9 => self.decode_vp9(packet),
+            // AVC/HEVC are never decoded in software: the gate
+            // lives in `hw`, and this decoder holds no license,
+            // so the answer is always the gate error.
+            Codec::Avc | Codec::Hevc => {
+                Err(crate::hw::licensed_software_path_error(self.config.codec))
+            }
         }
+    }
+
+    /// Decodes one AV1 temporal unit: one packet holds the OBUs of a
+    /// single frame (temporal delimiter, optional sequence header,
+    /// frame OBU). Keyframe intra only for now; the pipeline in
+    /// `av1_reconstruct` gates everything else with `Unsupported`
+    /// — today the coefficient CDF tables are missing, so a valid
+    /// keyframe returns `Unsupported` naming that gap and no
+    /// pixels exist yet. A packet showing an existing frame is
+    /// not covered: the pipeline expects a real frame OBU with
+    /// tile data.
+    fn decode_av1(&mut self, packet: &Packet) -> Result<Frame> {
+        if packet.data.len() > self.config.max_frame_bytes {
+            return Err(Error::AllocationLimit {
+                requested: packet.data.len(),
+                limit: self.config.max_frame_bytes,
+            });
+        }
+        let mut frame_payload: Option<Vec<u8>> = None;
+        let mut reader = ObuReader::new(&packet.data);
+        while let Some(obu) = reader.next_obu()? {
+            match obu.header.obu_type {
+                ObuType::SequenceHeader => {
+                    self.av1_sequence = Some(parse_sequence_header(obu.payload)?);
+                }
+                ObuType::Frame => {
+                    frame_payload = Some(obu.payload.to_vec());
+                }
+                _ => {}
+            }
+        }
+        let frame_payload = frame_payload.ok_or(Error::InvalidData {
+            offset: 0,
+            detail: "av1 packet has no frame OBU",
+        })?;
+        // Clone: `reconstruct_av1_frame_obu` needs `&mut self.av1_state`
+        // while the sequence header is still borrowed.
+        let seq = self.av1_sequence.clone().ok_or(Error::InvalidArgument(
+            "av1 sequence header has not been seen yet: construct the decoder from a sequence header",
+        ))?;
+        let video =
+            reconstruct_av1_frame_obu(&frame_payload, &seq, &mut self.av1_state, packet.timestamp)?;
+        Ok(Frame::Video(video))
+    }
+
+    /// Decodes one VP9 packet. A packet may hold a superframe;
+    /// each sub-frame is decoded in order and the last decoded
+    /// frame is returned. Keyframes (and show-existing frames)
+    /// decode bit-exactly; inter frames return `Unsupported`
+    /// until motion compensation is pixel-correct, so the
+    /// decoder never returns wrong pixels for them.
+    fn decode_vp9(&mut self, packet: &Packet) -> Result<Frame> {
+        if packet.data.len() > self.config.max_frame_bytes {
+            return Err(Error::AllocationLimit {
+                requested: packet.data.len(),
+                limit: self.config.max_frame_bytes,
+            });
+        }
+        let mut shown: Option<VideoFrame> = None;
+        for (offset, size) in parse_superframe(&packet.data)? {
+            let sub = &packet.data[offset..offset + size];
+            let parsed = parse_vp9_frame(sub, &mut self.vp9_state)?;
+            if !parsed.header.frame_is_intra && !parsed.header.show_existing_frame {
+                return Err(Error::Unsupported(
+                    "vp9 inter-frame reconstruction is not yet pixel-correct (keyframes decode; inter frames return Unsupported)",
+                ));
+            }
+            let mut frame = reconstruct_vp9_frame(&parsed, sub, &mut self.vp9_recon_state)?;
+            frame.timestamp = packet.timestamp;
+            shown = Some(frame);
+        }
+        match shown {
+            Some(frame) => Ok(Frame::Video(frame)),
+            None => Err(Error::InvalidData {
+                offset: 0,
+                detail: "vp9 packet holds no frame",
+            }),
+        }
+    }
+
+    /// Decodes one ALAC frame. One packet holds exactly one
+    /// ALAC frame, as produced by an MP4 demuxer; the output
+    /// sample count comes from the frame's partial-frame count
+    /// (or the cookie's frame length) and is always <= 16384.
+    fn decode_alac(&mut self, packet: &Packet) -> Result<Frame> {
+        if packet.data.len() > self.config.max_frame_bytes {
+            return Err(Error::AllocationLimit {
+                requested: packet.data.len(),
+                limit: self.config.max_frame_bytes,
+            });
+        }
+        let config = self.alac_config.ok_or(Error::InvalidArgument(
+            "alac config not set: construct the decoder from an alac config",
+        ))?;
+        decode_alac_audio_frame(&packet.data, &config, packet.timestamp)
+    }
+
+    /// Decodes one MP3 Layer III frame. One packet holds exactly
+    /// one frame; the decoder state (bit reservoir, IMDCT
+    /// overlap, polyphase history) is created on the first frame
+    /// and carried across packets, so frames must be fed in
+    /// order from the start of the stream. Layers I and II
+    /// return `Unsupported` from the frame decoder.
+    fn decode_mp3(&mut self, packet: &Packet) -> Result<Frame> {
+        if packet.data.len() > self.config.max_frame_bytes {
+            return Err(Error::AllocationLimit {
+                requested: packet.data.len(),
+                limit: self.config.max_frame_bytes,
+            });
+        }
+        let decoder = self.mp3.get_or_insert_with(Mp3Decoder::new);
+        let mut audio = decoder.decode_frame(&packet.data)?;
+        audio.timestamp = packet.timestamp;
+        Ok(Frame::Audio(audio))
+    }
+
+    /// Decodes one AAC raw data block (one MP4 sample, or one
+    /// ADTS frame payload with the header stripped). The gate
+    /// in `decode` is what makes this reachable only with a
+    /// validated license; this method only runs the spectral
+    /// decoder built by `from_aac_config`.
+    fn decode_aac(&mut self, packet: &Packet) -> Result<Frame> {
+        if packet.data.len() > self.config.max_frame_bytes {
+            return Err(Error::AllocationLimit {
+                requested: packet.data.len(),
+                limit: self.config.max_frame_bytes,
+            });
+        }
+        let decoder = self.aac.as_mut().ok_or(Error::InvalidArgument(
+            "aac config not set: construct the decoder from an aac config",
+        ))?;
+        let frame = decoder.decode_raw_data_block(&packet.data)?;
+        Ok(Frame::Audio(AudioFrame {
+            sample_rate: frame.sample_rate,
+            channels: frame.channels,
+            samples: frame.samples,
+            timestamp: packet.timestamp,
+        }))
+    }
+
+    /// Decodes one DSD packet. The packet holds raw DSD bytes
+    /// in the header's layout (DSF block groups or DFF
+    /// byte-interleaved); the decimator carries the filter state
+    /// across packets, so early packets may produce an empty
+    /// frame while the filter fills, and the tail only appears
+    /// on `flush`.
+    fn decode_dsd(&mut self, packet: &Packet) -> Result<Frame> {
+        if packet.data.len() > self.config.max_frame_bytes {
+            return Err(Error::AllocationLimit {
+                requested: packet.data.len(),
+                limit: self.config.max_frame_bytes,
+            });
+        }
+        let (channels, target_rate) = {
+            let header = self.dsd_header.as_ref().ok_or(Error::InvalidArgument(
+                "dsd header not set: construct the decoder from a dsd header",
+            ))?;
+            let decimator = self.dsd_decimator.as_ref().ok_or(Error::InvalidArgument(
+                "dsd header not set: construct the decoder from a dsd header",
+            ))?;
+            (header.channels, decimator.target_rate())
+        };
+        let decimator = self.dsd_decimator.as_mut().ok_or(Error::InvalidArgument(
+            "dsd header not set: construct the decoder from a dsd header",
+        ))?;
+        let samples = decimator.feed(&packet.data)?;
+        Ok(Frame::Audio(AudioFrame {
+            sample_rate: target_rate,
+            channels,
+            samples,
+            timestamp: packet.timestamp,
+        }))
     }
 
     /// Decodes one Opus packet (RFC 6716, RFC 7845). Phase 4 decodes
@@ -481,9 +877,15 @@ impl Decoder {
                         samples
                             .extend_from_slice(&celt_conceal_loss(frame_duration, packet_channels));
                     } else {
-                        return Err(Error::Unsupported(
-                            "opus celt sample decode (celt sample reconstruction not implemented in phase 4; frame header decoded)",
-                        ));
+                        let celt = self.celt.as_mut().ok_or(Error::InvalidArgument(
+                            "opus celt decoder not initialised: construct the decoder from an opus head",
+                        ))?;
+                        let decoded = celt.decode_frame(
+                            frame,
+                            celt_end_band(opus_packet.config.bandwidth),
+                            frame_duration,
+                        )?;
+                        samples.extend_from_slice(&decoded);
                     }
                 }
             }
@@ -638,6 +1040,42 @@ impl Decoder {
     /// This implementation never fails; the `Result` exists so later
     /// codecs with delay can report errors here.
     pub fn flush(&mut self) -> Result<Option<Frame>> {
+        if self.config.codec == Codec::Dsd {
+            let Some(decimator) = self.dsd_decimator.as_mut() else {
+                return Ok(None);
+            };
+            let samples = decimator.flush()?;
+            if samples.is_empty() {
+                return Ok(None);
+            }
+            let (channels, target_rate) = {
+                let header = self.dsd_header.as_ref().ok_or(Error::InvalidArgument(
+                    "dsd header not set: construct the decoder from a dsd header",
+                ))?;
+                (header.channels, decimator.target_rate())
+            };
+            // The tail starts one frame-duration before the end
+            // of the stream; its timestamp is derived from the
+            // sample count, not from a packet timestamp.
+            let tail_frames = samples.len() / channels.max(1) as usize;
+            let timestamp_us = self.dsd_header.as_ref().map_or(0, |header| {
+                // DSF declares the sample count; DFF does
+                // not, so it is derived from the data size.
+                let total_samples = if header.sample_count > 0 {
+                    header.sample_count
+                } else {
+                    header.data_size / u64::from(header.channels) * 8
+                };
+                total_samples.saturating_sub(tail_frames as u64) * 1_000_000
+                    / u64::from(header.sample_rate)
+            });
+            return Ok(Some(Frame::Audio(AudioFrame {
+                sample_rate: target_rate,
+                channels,
+                samples,
+                timestamp: timestamp_us,
+            })));
+        }
         if self.config.codec != Codec::Vorbis {
             return Ok(None);
         }
@@ -795,11 +1233,15 @@ mod tests {
     }
 
     #[test]
-    fn av1_decoder_rejects_reconstruction_as_unsupported() {
+    fn av1_decoder_rejects_reserved_obu_packet_as_invalid_data() {
         use crate::av1_sequence::parse_sequence_header;
         let seq_bytes = [0x00u8, 0x00, 0x00, 0x02, 0xAF, 0xFF, 0x9B, 0x5F, 0x20, 0x08];
         let seq = parse_sequence_header(&seq_bytes).unwrap();
         let mut decoder = Decoder::from_av1_sequence_header(&seq).unwrap();
+        // Ten zero bytes: the first OBU has the reserved type 0,
+        // which the decoder skips, and no frame OBU follows, so
+        // the packet fails as "no frame OBU" rather than reaching
+        // reconstruction.
         let packet = Packet {
             codec: Codec::Av1,
             data: vec![0u8; 10],
@@ -807,7 +1249,7 @@ mod tests {
             is_keyframe: true,
         };
         let err = decoder.decode(&packet).unwrap_err();
-        assert!(matches!(err, Error::Unsupported(_)));
+        assert!(matches!(err, Error::InvalidData { .. }));
     }
 
     #[test]
@@ -823,8 +1265,10 @@ mod tests {
     }
 
     #[test]
-    fn vp9_decoder_rejects_reconstruction_as_unsupported() {
+    fn vp9_decoder_rejects_garbage_packet_as_invalid_data() {
         let mut decoder = Decoder::from_vp9_frame_header(&Vp9FrameHeader::default()).unwrap();
+        // Ten zero bytes: the frame marker is 0, not 2, so the
+        // header parse fails before reconstruction is reached.
         let packet = Packet {
             codec: Codec::Vp9,
             data: vec![0u8; 10],
@@ -832,7 +1276,7 @@ mod tests {
             is_keyframe: true,
         };
         let err = decoder.decode(&packet).unwrap_err();
-        assert!(matches!(err, Error::Unsupported(_)));
+        assert!(matches!(err, Error::InvalidData { .. }));
     }
 
     #[test]

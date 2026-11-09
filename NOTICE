@@ -1,0 +1,91 @@
+# NOTICE — codec-whatttttttttttt
+
+This file records the licensing and patent-status notes that apply
+to this library. It is not legal advice. The library's own code is
+licensed MIT OR Apache-2.0 (see `LICENSE-MIT` and `LICENSE-APACHE`);
+the notes below concern the codecs the library does or may handle,
+not the library's own license.
+
+## Open formats already implemented
+
+PCM/WAV, FLAC, Opus, Vorbis, AV1, and VP9 are open standards. They
+are implemented in software in this library with no license gate.
+(AV1 and VP9 are parser-only in Phases 7–8: headers and tile
+framing parse; pixel reconstruction returns `Unsupported`.)
+
+## H.264/AVC, H.265/HEVC, AAC — behind a license gate
+
+H.264/AVC, H.265/HEVC, and AAC are patent-encumbered codecs. This
+library contains **no software encoder or decoder for AVC or
+HEVC**, and never will: `Decoder::decode` and `Encoder::encode`
+refuse `Codec::Avc` and `Codec::Hevc` outright. The only path is
+the hardware path in `crates/codec-whatttttttttttt-core/src/hw.rs`
+(`HardwareDecoder` / `HardwareEncoder`, currently a stub that
+calls no real hardware API), opened with a caller-supplied
+`LicenseContext` (`crates/codec-whatttttttttttt-core/src/license.rs`).
+
+AAC is different: AAC-LC has a software decoder
+(`Decoder::from_aac_config` in
+`crates/codec-whatttttttttttt-core/src/decoder.rs`), allowed only
+when the `licensed-aac` feature is on and a valid `LicenseContext`
+was presented and validated at construction. Without a license
+the software path returns the gate error
+(`Error::Unsupported` when the feature is off,
+`Error::LicenseRequired` when it is on). There is no software
+AAC encoder in this library; `Encoder::encode` for `Codec::Aac`
+returns the same gate error.
+
+The gate is **off by default**. It is controlled by the Cargo
+features `licensed-avc-hevc` and `licensed-aac` in
+`crates/codec-whatttttttttttt-core/Cargo.toml` (`default = []`):
+
+- Feature off: the licensed path is not compiled in, and the
+  software path returns `Error::Unsupported`.
+- Feature on, no valid license presented: the path exists and is
+  closed, and the error is `Error::LicenseRequired { codec }`
+  (C ABI code `CODEC_ERR_LICENSE_REQUIRED = 8`).
+- A malformed license is `Error::InvalidArgument`; an expired
+  license is `Error::LicenseRequired`.
+
+There is a `Codec::Aac` variant. The `licensed-aac` feature
+gates both the AAC-LC software decode path
+(`Decoder::from_aac_config`) and the hardware path in `hw.rs`.
+
+The gate is a compliance mechanism only. It checks the shape of
+a caller-supplied license (id format, expiry) and records an
+in-memory audit log; it performs no online verification, holds
+no key, and cannot establish the legal standing of a license.
+**It does not replace a real patent license, and it is not legal
+advice.** The caller is responsible for obtaining whatever
+patent licenses apply, from the relevant patent pools, before
+enabling the features or using the hardware path.
+
+## MP3 — not implemented; patent status needs verification
+
+MP3 is **not implemented** in this library (no MP3 encode or
+decode in any phase so far). If MP3 support is added in a later
+phase, its current patent status must be verified first:
+"cần xác minh tình trạng bằng sáng chế hiện tại" — do not assume
+from this file that MP3 is unencumbered, and do not add MP3 code
+until that check has been done and recorded here.
+
+## ALAC — implemented from Apple's open-source reference (Apache-2.0)
+
+ALAC is implemented in software in this library
+(`crates/codec-whatttttttttttt-core/src/alac_frame.rs` and
+`src/alac_predictor.rs`: magic-cookie parsing, frame elements,
+adaptive Rice decode, LPC predictor, channel decorrelation),
+with no license gate. The implementation follows Apple's
+open-source ALAC reference implementation, published by Apple
+under the Apache License 2.0
+(<https://github.com/macosforge/alac>); the algorithm was
+re-implemented in Rust from that published source, which is the
+attribution this file carries. ALAC encode is not implemented
+yet; `Encoder::encode` for `Codec::Alac` returns
+`Error::Unsupported`.
+
+## No other patented codecs
+
+No other patent-encumbered codec is implemented or planned in
+this round. Any future codec addition must record its patent /
+license status in this file before its code lands.

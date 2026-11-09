@@ -60,6 +60,18 @@ pub const MAX_FLAC_FILE_BYTES: usize = 512 * 1024 * 1024;
 /// Largest Ogg file accepted by `OggDemuxer` (512 MiB).
 pub const MAX_OGG_FILE_BYTES: usize = 512 * 1024 * 1024;
 
+/// Largest MPEG-TS file accepted by `TsDemuxer` (512 MiB).
+pub const MAX_MPEGTS_FILE_BYTES: usize = 512 * 1024 * 1024;
+
+/// Largest ADTS file accepted by `AdtsDemuxer` (512 MiB).
+pub const MAX_ADTS_FILE_BYTES: usize = 512 * 1024 * 1024;
+
+/// Largest AIFF file accepted by `AiffDemuxer` (512 MiB).
+pub const MAX_AIFF_FILE_BYTES: usize = 512 * 1024 * 1024;
+
+/// Largest `ID3v2` tag accepted (16 MiB; tags carry cover art).
+pub const MAX_ID3_TAG_BYTES: usize = 16 * 1024 * 1024;
+
 /// Chunk size used by `BoundedReader` (64 KiB).
 pub const READ_CHUNK_BYTES: usize = 64 * 1024;
 

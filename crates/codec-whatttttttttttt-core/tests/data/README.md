@@ -249,3 +249,435 @@ stream_count 235 + coupled_count 43) is small enough to live
 inline in `tests/opus.rs`
 (`opus_head_family1_stream_count_sum_overflow_returns_error`),
 so it has no fixture file.
+
+## Next phase: passthrough + container fixtures
+
+Video is `testsrc2` at 64x64, 10 fps, 1 s; audio is a local
+sine AAC (44100 Hz, mono). All files were produced with
+ffmpeg 8.1.2 from local CC0 sources. The exact ffmpeg
+command lines were recorded only in the worker task report
+and are not checked in here; the properties below were
+verified with `ffprobe` on the checked-in files
+(2026-11-08/09), and the packet counts are the values the
+integration tests assert (`tests/passthrough.rs`,
+`tests/mpeg_ts.rs`, `tests/mp4_tag.rs`).
+
+- `avc_aac.mp4` (7990 bytes): H.264 64x64 10 fps +
+  AAC 44100 Hz mono. 55 packets (10 AVC + 45 AAC).
+  `meta`/`ilst` tags: title "Passthrough AVC", artist
+  "Test Artist", album "Test Album". The `avc1` sample
+  entry's `avcC` and the `mp4a` entry's `esds` are the
+  passthrough `codec_private` blobs.
+- `hevc_aac.mp4` (9384 bytes): HEVC 64x64 10 fps +
+  AAC 44100 Hz mono. 55 packets (10 HEVC + 45 AAC).
+  The `hev1` sample entry's `hvcC` is the passthrough
+  `codec_private` blob.
+- `avc_aac.mkv` (7125 bytes): the same streams in
+  Matroska (`V_MPEG4/ISO/AVC` + `A_AAC`). 55 packets
+  (10 AVC + 45 AAC).
+- `avc_aac.ts` (12220 bytes): the same streams in
+  MPEG-TS: 65 TS packets of 188 bytes, 13 PES packets
+  (10 video + 3 audio). One audio PES holds many ADTS
+  frames — ffmpeg packs ~15 AAC frames per PES — so the
+  demuxer must split ADTS frames out of a PES payload,
+  not assume one frame per PES.
+- `sine_aac.m4a` (5143 bytes): AAC 44100 Hz mono, 45
+  frames, 1.000 s, with an `ilst` title tag "M4A Title".
+  ffmpeg's MP4 muxer writes an edit list that skips the
+  first AAC frame (encoder priming), so the
+  `_m4a_ref.raw` reference starts at stream frame 1.
+
+## Next phase: ADTS and AIFF fixtures
+
+- `sine_aac.adts` (4438 bytes): AAC-LC ADTS, 44100 Hz,
+  mono, 45 frames, 1.045 s, `protection_absent` set (no
+  CRC). First frame is 160 bytes (7-byte header +
+  153-byte payload). Encoded by ffmpeg 8.1.2 from a
+  local CC0 sine source; exact command not checked in.
+- `sine_aac_crc.adts` (162 bytes): one ADTS frame with
+  CRC (`protection_absent` clear, 9-byte header). Built
+  locally from the ffmpeg frame in `sine_aac.adts` by
+  appending a Python-computed CRC-16 (polynomial
+  `0x8005`, init `0xFFFF`); see `tests/adts.rs`.
+- `sine_aiff.aiff` (88254 bytes): PCM s16be, 44100 Hz,
+  mono, 44100 frames, 88200 data bytes. Encoded by
+  ffmpeg 8.1.2 from a local CC0 sine source; exact
+  command not checked in.
+- `sine_aifc.aifc` (88272 bytes): the same audio as
+  AIFF-C with `sowt` compression (little-endian
+  samples), so the demuxer must byte-swap. Encoded by
+  ffmpeg 8.1.2 from a local CC0 sine source; exact
+  command not checked in.
+
+## Next phase: MP3 fixtures
+
+MP3 files encoded with ffmpeg 8.1.2 (libmp3lame) from
+locally generated WAVs (0.5 s sine, 1 s sweep/transient;
+the source WAVs are not checked in). The reference
+`.ref.raw` files (note the dot: `*.ref.raw`, unlike the
+AAC/ALAC `_ref.raw` suffix) are ffmpeg's own decode
+(`-f f32le`) of the same files. The exact ffmpeg command
+lines were recorded only in the worker task report and
+are not checked in here.
+
+Conformance thresholds (ISO/IEC 11172-4 section 2.6.3):
+full compliance is RMS < 8.80967e-06 with max abs diff
+<= 6.10352e-05. Measured 2026-11-08 (all at alignment
+offset 2257 samples): mono 96k RMS 1.84e-7 / max
+1.13e-6; stereo 128k RMS 2.69e-7 / max 1.91e-6; stereo
+64k RMS 2.68e-7 / max 1.37e-6; stereo 48000 320k RMS
+2.74e-7 / max 1.28e-6; sweep 128k RMS 6.44e-8 / max
+6.26e-7; transient 128k RMS 1.98e-8 / max 6.56e-7.
+Every fixture passes with at least 30x headroom. The
+decoder outputs raw frames including the encoder-delay
+priming samples; ffmpeg's decode trims that delay, so
+the comparison aligns by searching the offset (in
+samples per channel) that minimises the RMS difference
+— around 2257: the 1152-sample Xing/LAME info frame
+plus the 576-sample encoder delay plus ffmpeg's
+528-sample decoder delay (measured, not assumed). See
+`tests/mp3.rs`.
+
+- `sine_mono_44100_96k.mp3` (6941 bytes): mono,
+  44100 Hz, 96 kbps, 0.5 s; ref 88200 bytes
+  (22050 f32 samples).
+- `sine_stereo_44100_128k.mp3` (9239 bytes): stereo,
+  44100 Hz, 128 kbps, 0.5 s; ref 176400 bytes
+  (22050 frames).
+- `sine_stereo_44100_64k.mp3` (4641 bytes): stereo,
+  44100 Hz, 64 kbps, 0.5 s; ref 176400 bytes.
+- `sine_stereo_48000_320k.mp3` (22125 bytes): stereo,
+  48000 Hz, 320 kbps, 0.5 s; ref 192000 bytes
+  (24000 frames).
+- `sweep_stereo_44100_128k.mp3` (17180 bytes): stereo,
+  44100 Hz, 128 kbps, 1.0 s sine sweep; ref 352800
+  bytes (44100 frames).
+- `transient_stereo_44100_128k.mp3` (9239 bytes):
+  stereo, 44100 Hz, 128 kbps, 0.5 s transient signal;
+  ref 176400 bytes.
+- `sine_stereo_44100_layer2.mp2` (8359 bytes): Layer II
+  (MP2), stereo, 44100 Hz, 128 kbps, 0.522 s. Negative
+  fixture: Layer I/II decode is `Unsupported`, so this
+  file has no reference PCM.
+
+## Next phase: AAC fixtures
+
+AAC-LC files encoded by ffmpeg 8.1.2 from local CC0
+WAV sources. The reference `_ref.raw` files are
+ffmpeg's own decode (`-f f32le`) of the same files.
+The exact ffmpeg command lines were recorded only in
+the worker task report and are not checked in here.
+
+Thresholds (ISO/IEC 13818-4 conformance style, stated
+in `tests/aac.rs`): max absolute sample error 2.0e-3,
+RMS error 5.0e-4. Measured 2026-11-08: worst case max
+abs 7.9e-5 / RMS 3.0e-6 (burst, 128k, short windows);
+all other fixtures measure max abs <= 3e-6 and RMS <=
+2e-6. The `.m4a` references start at stream frame 1
+(ffmpeg's edit list skips the priming frame; see the
+passthrough section above).
+
+- `aac_stereo_44100_128k.aac` (1893 bytes): stereo,
+  44100 Hz, 128 kbps, 6 frames (0.139 s); ref 49152
+  bytes (6144 frames).
+- `aac_stereo_44100_64k.aac` (918 bytes): stereo,
+  44100 Hz, 64 kbps, 6 frames; ref 49152 bytes.
+- `aac_stereo_44100_320k.aac` (3526 bytes): stereo,
+  44100 Hz, 320 kbps, 6 frames; ref 49152 bytes.
+- `aac_stereo_48000_96k.aac` (411 bytes): stereo,
+  48000 Hz, 96 kbps, 2 frames (0.043 s); ref 16384
+  bytes (2048 frames).
+- `aac_mono_8000_64k.aac` (1153 bytes): mono, 8000 Hz,
+  64 kbps, 2 frames; ref 8192 bytes (2048 samples).
+  (ffprobe on this box cannot probe raw ADTS — its
+  ffmpeg build has no ADTS demuxer — so the rate and
+  channel count here come from the test asserts in
+  `tests/aac.rs`, not from ffprobe.)
+- `aac_tone_44100_128k.aac` (16129 bytes): stereo,
+  44100 Hz, 128 kbps, 45 frames (1.045 s), pure tone;
+  ref 368640 bytes (46080 frames). Source WAV
+  `aac_tone_stereo_44100.wav` (checked in: 1 s stereo
+  16-bit 44100 Hz).
+- `aac_burst_44100_128k.aac` (16017 bytes): stereo,
+  44100 Hz, 128 kbps, 45 frames, burst signal chosen
+  to force short windows (`EIGHT_SHORT`); ref 368640
+  bytes. Source WAV `aac_burst_stereo_44100.wav`
+  (checked in: 1 s stereo 16-bit 44100 Hz).
+- `aac_stereo_44100_128k.m4a` (2682 bytes): stereo,
+  44100 Hz, 128 kbps, 0.100 s; ref
+  `aac_stereo_44100_128k_m4a_ref.raw` 40960 bytes
+  (5120 frames, starting at stream frame 1).
+- `aac_stereo_48000_96k.m4a` (1212 bytes): stereo,
+  48000 Hz, 96 kbps, 0.010 s (1 frame after priming);
+  ref `aac_stereo_48000_96k_m4a_ref.raw` 8192 bytes
+  (1024 frames).
+- `aac_mono_8000_64k.m4a` (1954 bytes): mono, 8000 Hz,
+  64 kbps, 0.100 s; ref `aac_mono_8000_64k_m4a_ref.raw`
+  4096 bytes (1024 samples, starting at stream
+  frame 1).
+
+## Next phase: ALAC fixtures
+
+ALAC files encoded by ffmpeg 8.1.2 (native ALAC
+encoder) in `.m4a` from the existing WAV fixtures in
+this directory. Decoding must be bit-exact: ALAC is
+lossless, so every integer sample must equal ffmpeg's
+decode of the same file, sample for sample. The
+reference `_ref.raw` files are ffmpeg's own decode
+(`-f s16le` / `-f s32le`), checked in alongside the
+fixtures. The exact ffmpeg command lines were recorded
+only in the worker task report and are not checked in
+here.
+
+- `alac_mono_8000.m4a` (1789 bytes): mono, 8000 Hz,
+  0.100 s (800 samples), 16-bit; source
+  `valid_i16_mono_8000.wav`; ref 1600 bytes s16le.
+- `alac_mono_8000_s32.m4a` (2589 bytes): mono, 8000 Hz,
+  0.100 s, 32-bit source (the 32-bit source WAV is not
+  checked in); ffmpeg's ALAC encoder writes 24-bit
+  ALAC for s32 input; ref 3200 bytes s32le.
+- `alac_noise_mono_8000.m4a` (2335 bytes): mono,
+  8000 Hz, 0.100 s, white noise; source
+  `noise_mono_8000.wav`; ref 1600 bytes s16le.
+- `alac_ramp_mono_8000.m4a` (840 bytes): mono, 8000 Hz,
+  0.100 s, linear ramp; source `ramp_mono_8000.wav`;
+  ref 1600 bytes s16le.
+- `alac_stereo_44100.m4a` (4375 bytes): stereo,
+  44100 Hz, 0.100 s (4410 frames), 16-bit; source
+  `valid_i16_stereo_44100.wav`; ref 17640 bytes s16le.
+- `alac_stereo_44100_s32.m4a` (13195 bytes): stereo,
+  44100 Hz, 0.100 s, 32-bit source (the 32-bit source
+  WAV is not checked in); ref 35280 bytes s32le.
+
+## Next phase: ID3 fixture
+
+- `tagged.mp3` (4516 bytes): MP3 mono, 44100 Hz,
+  32 kbps, 1.000 s, from a local CC0 sine source, with
+  ID3v2.3 tags: title "ID3 Title", artist "ID3 Artist",
+  album "ID3 Album", track 3, year "2026", genre "Rock".
+  Produced with ffmpeg 8.1.2; the exact command was
+  recorded only in the worker task report and is not
+  checked in here. ID3v1 vectors are built in code in
+  `tests/id3.rs` (`write_id3v1` round-trip), not stored
+  as files.
+
+## Next phase: DSD fixtures
+
+The eight `dsf_dsd{64,128,256,512}_stereo.dsf` /
+`dff_dsd{64,128,256,512}_stereo.dff` files were
+generated by `/tmp/gen_dsd_fixtures.py` (kept outside
+the repo; the algorithm is re-implemented in Rust in
+`tests/dsd.rs` for the in-memory variants). Each holds
+0.1 s of stereo audio: left 1000 Hz sine, right
+1500 Hz sine, amplitude 0.5, produced by a first-order
+sigma-delta modulator written for the fixtures. No
+real DSD recording was used, and no "looks like DSD"
+bytes were invented: every bit comes out of the
+modulator from the known sine.
+
+- `dsf_dsd64_stereo.dsf` (73820 bytes) / `dff_dsd64_stereo.dff`
+  (70708 bytes): DSD64, 2.8224 MHz.
+- `dsf_dsd128_stereo.dsf` (147548 bytes) / `dff_dsd128_stereo.dff`
+  (141268 bytes): DSD128, 5.6448 MHz.
+- `dsf_dsd256_stereo.dsf` (286812 bytes) / `dff_dsd256_stereo.dff`
+  (282388 bytes): DSD256, 11.2896 MHz.
+- `dsf_dsd512_stereo.dsf` (565340 bytes) / `dff_dsd512_stereo.dff`
+  (564628 bytes): DSD512, 22.5792 MHz.
+
+ffmpeg 8.1.2 has DSD *decoders* but no PCM-to-DSD
+encoder (`ffmpeg -encoders | grep -i dsd` returns
+nothing), so no reference encoder could have produced
+these files. Independent cross-check: ffmpeg 8.1.2
+decodes the DFF fixtures to exactly 0.500 amplitude on
+both channels (measured 2026-11-08), which validates
+the modulator and the MSB-first packing. ffmpeg's DSF
+path does NOT decode these DSF files (it returns noise
+for both the spec-correct block layout and a
+byte-interleaved variant, and a DC test file decodes to
+toggling +/-1), so ffmpeg is not used as the DSF
+reference: the DSF layout is validated against the Sony
+DSF spec text (block size per channel 4096, LSB-first)
+and the sacd-ripper/PipeWire implementations instead.
+The fixtures are synthetic data generated for this
+project (no third-party audio), so there is no
+third-party license to record; they are covered by the
+workspace license like any other test vector.
+
+## Final round (2026-11-09): small items, encoders, PCM→DSD, CELT, VP9, AV1
+
+All fixtures below are synthetic data generated for this
+project (no third-party audio); they are covered by the
+workspace license like any other test vector. Where a
+worker's exact generation command was recorded, it is
+quoted; where it was not recorded, the file's properties
+are stated instead and no command is invented.
+
+### MP3-in-TS, FLAC wide
+
+- `mp3ts_sine_stereo_44100_128k.ts` (20868 bytes) +
+  `mp3ts_sine_stereo_44100_128k_ref.raw` (368640 bytes):
+  MPEG-TS carrying MP3 Layer III (sine stereo, 44100 Hz,
+  128 kbps), encoded with ffmpeg 8.1.2; the reference is
+  ffmpeg's decode of the same file (`-f f32le`). Exact
+  command not recorded.
+- `flac24_sine_stereo_44100.flac` (32799 bytes) +
+  `flac24_sine_stereo_44100_ref.raw` (176400 bytes): 24-bit
+  stereo FLAC, 44100 Hz, encoded with ffmpeg 8.1.2; the
+  reference is ffmpeg's decode. Exact command not recorded.
+- `flac51_sine_44100.flac` (203069 bytes) +
+  `flac51_sine_44100_ref.raw` (529200 bytes): 5.1-channel
+  FLAC, 44100 Hz, encoded with ffmpeg 8.1.2; the reference
+  is ffmpeg's decode. Exact command not recorded.
+- `flac20_verbatim_mono_8000.flac` (92 bytes) +
+  `flac20_verbatim_mono_8000_ref.raw` (64 bytes): 20-bit
+  mono FLAC, 8000 Hz, hand-crafted (ffmpeg cannot emit
+  20-bit FLAC); the reference is the known PCM (verbatim
+  subframe).
+
+### MP3 encode
+
+Source WAVs are sine tones made with ffmpeg 8.1.2
+(`lavfi sine` + `volume` + `pcm_s16le`; exact commands
+were not recorded):
+
+- `mp3enc_sine_mono_22050.wav` (44178 bytes),
+  `mp3enc_sine_mono_44100.wav` (88278 bytes),
+  `mp3enc_sine_stereo_44100.wav` (176478 bytes),
+  `mp3enc_tones_mono_44100.wav` (88278 bytes).
+- `mp3enc_sine_stereo_44100_128k.mp3` (16263 bytes) is the
+  library encoder's own output at CBR 128 kbps, and
+  `mp3enc_sine_stereo_44100_128k_ref.raw` (359424 bytes) is
+  ffmpeg's decode of it (`-f f32le`).
+
+### AAC encode
+
+Source WAVs made with ffmpeg 8.1.2:
+
+- `ffmpeg -f lavfi -i "sine=frequency=440:sample_rate=44100:duration=2" -f lavfi -i "sine=frequency=660:sample_rate=44100:duration=2" -filter_complex "[0:a][1:a]amerge=inputs=2[a]" -map "[a]" -c:a pcm_s16le aacenc_sine_44100_stereo.wav` (352878 bytes, stereo 44100 Hz)
+- `ffmpeg -f lavfi -i "sine=frequency=440:sample_rate=8000:duration=2" -c:a pcm_s16le aacenc_sine_8000_mono.wav` (32078 bytes, mono 8000 Hz)
+
+The `.adts` files are the library encoder's own output
+(test `generate_aacenc_fixtures`, run with `-- --ignored`),
+and the `_ffdec.raw` files are ffmpeg's decode of them
+(`ffmpeg -i <adts> -f f32le -acodec pcm_f32le <raw>`):
+
+- `aacenc_sine_44100_stereo.adts` (12747 bytes, 87 frames)
+  + `aacenc_sine_44100_stereo_ffdec.raw` (712704 bytes)
+- `aacenc_sine_8000_mono.adts` (2462 bytes, 16 frames) +
+  `aacenc_sine_8000_mono_ffdec.raw` (65536 bytes)
+
+### ALAC encode
+
+Source WAVs are sine/noise tones made with ffmpeg 8.1.2
+(exact commands not recorded); the `.m4a` files are the
+library encoder's own output and the `_ref.raw` files are
+ffmpeg's decode of them (`-f f32le`):
+
+- `alacenc_sine_mono_8000.wav` (8236 bytes) /
+  `alacenc_sine_mono_8000.m4a` (7287 bytes) /
+  `alacenc_sine_mono_8000_ref.raw` (8192 bytes): 16-bit mono
+- `alacenc_sine_mono_8000_24bit.wav` (12332 bytes) /
+  `alacenc_sine_mono_8000_24bit.m4a` (13019 bytes) /
+  `alacenc_sine_mono_8000_24bit_ref.raw` (16384 bytes):
+  24-bit mono
+- `alacenc_noise_mono_8000.wav` (8236 bytes) /
+  `alacenc_noise_mono_8000.m4a` (8923 bytes) /
+  `alacenc_noise_mono_8000_ref.raw` (8192 bytes): 16-bit mono
+  noise
+- `alacenc_sine_stereo_44100.wav` (32812 bytes) /
+  `alacenc_sine_stereo_44100.m4a` (18740 bytes) /
+  `alacenc_sine_stereo_44100_ref.raw` (32768 bytes): 16-bit
+  stereo
+
+### PCM→DSD
+
+- `dsdmod_sine_stereo_44100.wav` (17684 bytes): source sine
+  stereo, 44100 Hz, made with ffmpeg 8.1.2 (exact command
+  not recorded).
+- `dsdmod_dsd64_stereo.dsf` (73820 bytes),
+  `dsdmod_dsd64_stereo.dff` (73842 bytes),
+  `dsdmod_dsd128_stereo.dsf` (147548 bytes): the library
+  modulator's own output from that WAV (test generator, run
+  with `-- --ignored`). ffmpeg cross-check on the DFF:
+  amplitude 0.4998/0.4995 vs target 0.5.
+
+### Opus CELT
+
+WAVs are synthetic, made with numpy (seeded where noted);
+the `.opus` files are CELT-only, fullband, 960
+samples/frame, stereo, 101 frames, pre-skip 312, encoded
+with ffmpeg 8.1.2:
+
+- `ffmpeg -i <wav> -c:a libopus -b:a 128k -vbr on -application audio -frame_duration 20 <name>.opus`
+- Reference: `ffmpeg -i <opus> -f f32le -ac 2 -ar 48000 <name>_ref.raw`
+
+- `celt_sine_stereo_48000.opus` (45570 bytes): sine 440 Hz
+  L / 550 Hz R, amp 0.5.
+- `celt_noise_stereo_48000.opus` (30178 bytes): white noise
+  uniform ±0.5, seed 1234.
+- `celt_music_stereo_48000.opus` (35289 bytes): 4 chords
+  (C, Am, F, G) × 0.5 s, 3 partials + 6 Hz tremolo.
+- `celt_speech_stereo_48000.opus` (42467 bytes):
+  speech-like formant bursts (300/900/2400 Hz, f0 90–160 Hz,
+  seed 77).
+- Each `*_ref.raw` is 768000 bytes (96000 samples/channel
+  f32le). The 8 kHz mono SILK fixture was not used for CELT.
+
+### VP9 reconstruction
+
+All files are 10 fps, 10 frames, encoded with ffmpeg
+8.1.2 (libvpx-vp9, Profile 0, yuv420p); each `*_ref.yuv`
+is ffmpeg's rawvideo yuv420p decode of the same file.
+Exact encode commands were not recorded.
+
+- `vp9rec_keyonly_64x64.ivf` (17874 bytes) +
+  `vp9rec_keyonly_64x64_ref.yuv` (61440 bytes): keyframes
+  only, 64×64.
+- `vp9rec_lossless_64x64.ivf` (23026 bytes) +
+  `vp9rec_lossless_64x64_ref.yuv` (61440 bytes): lossless
+  (WHT path), 64×64.
+- `vp9rec_320x240.ivf` (19728 bytes) +
+  `vp9rec_320x240_ref.yuv` (1152000 bytes): 320×240.
+- `vp9rec_320x240_fp0.ivf` (19454 bytes) +
+  `vp9rec_320x240_fp0_ref.yuv` (1152000 bytes): same size,
+  frame-parallel decoding off.
+- `vp9rec_640x480.ivf` (55836 bytes) +
+  `vp9rec_640x480_ref.yuv` (4608000 bytes): 640×480, 2 tile
+  columns.
+- `vp9rec_mandel_64x64.ivf` (3386 bytes) +
+  `vp9rec_mandel_64x64_ref.yuv` (61440 bytes),
+  `vp9rec_mandel_320x64.ivf` (3810 bytes) +
+  `vp9rec_mandel_320x64_ref.yuv` (307200 bytes),
+  `vp9rec_mandel_320x128.ivf` (9982 bytes) +
+  `vp9rec_mandel_320x128_ref.yuv` (614400 bytes),
+  `vp9rec_mandel_320x240.ivf` (23896 bytes) +
+  `vp9rec_mandel_320x240_ref.yuv` (1152000 bytes):
+  Mandelbrot test pattern at four sizes.
+- `vp9rec_mandel_320x128_lossless.ivf` (95820 bytes) +
+  `vp9rec_mandel_320x128_lossless_ref.yuv` (614400 bytes):
+  lossless Mandelbrot, 320×128.
+- `vp9rec_testsrc2_320x128.ivf` (15964 bytes) +
+  `vp9rec_testsrc2_320x128_ref.yuv` (614400 bytes):
+  ffmpeg `testsrc2`, 320×128.
+- Reference YUVs generated for the Phase 8 fixtures:
+  `vp9_64x64_ref.yuv` (61440 bytes, 10 frames),
+  `vp9_keyframes_ref.yuv` (61440 bytes),
+  `vp9_tiles_ref.yuv` (491520 bytes),
+  `vp9_superframe_ref.yuv` (12288 bytes).
+- `vp9rec_tiles_640x480.ivf` was deleted: byte-identical to
+  `vp9rec_640x480.ivf` (this ffmpeg/libvpx ignores
+  `-tile-rows`).
+
+### AV1 reconstruction
+
+Encoded with ffmpeg 8.1.2 (libaom-av1), keyframe-only,
+CDEF + loop restoration off; each `*_f0.yuv` is ffmpeg's
+rawvideo yuv420p decode of frame 0. Exact encode commands
+were not recorded.
+
+- `av1rec_64x64.ivf` (6855 bytes) +
+  `av1rec_64x64_f0.yuv` (6144 bytes): 64×64.
+- `av1rec_320x240.ivf` (20769 bytes) +
+  `av1rec_320x240_f0.yuv` (115200 bytes): 320×240.
+- `av1rec_640x480.ivf` (50826 bytes) +
+  `av1rec_640x480_f0.yuv` (460800 bytes): 640×480.

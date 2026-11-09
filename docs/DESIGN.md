@@ -22,9 +22,22 @@ Core in Rust. Thin bindings call the core through a C ABI. No logic duplicated i
 
 ### 1.2 Non-goals for v0.1–v1.0
 
-- No patented codecs: no H.264, H.265, AAC, MP3 encode/decode in this library.
+- No patented codecs in software: no H.264, H.265, or AAC
+  encode in software in this library, and no H.264/H.265
+  software decode. H.264/H.265 exist only behind the license
+  gate added in the 2026-11-08 revision round: Cargo features
+  `licensed-avc-hevc` / `licensed-aac`, off by default,
+  hardware path only (`hw.rs`), never software decode or
+  encode. AAC-LC software decode landed in the next phase
+  behind `licensed-aac`; MP3 Layer III and ALAC software
+  decode also landed in the next phase (MP3 encode and ALAC
+  encode are still not implemented). See `NOTICE` and
+  section 3.8.
 - No DRM, no network streaming protocol, no player UI, no capture.
-- No hardware encoder/decoder abstraction in v0.1. Software decode first.
+- No hardware encoder/decoder abstraction in v0.1, except the
+  license-gated hardware path for AVC/HEVC added in the
+  2026-11-08 revision round (`hw.rs`: traits plus a stub that
+  calls no real hardware API). Software decode first.
 - No full AV1 or VP9 encoder in v0.1. Basic encode only, after decode is verified.
 - No promise of real-time performance on all devices until benchmarks exist.
 
@@ -49,6 +62,7 @@ codec-whatttttttttttt/
   Cargo.toml                 # workspace
   Cargo.lock
   README.md
+  NOTICE                     # license-gate and patent-status notes (revision round 2026-11-08)
   LICENSE-MIT
   LICENSE-APACHE
   CHANGELOG.md
@@ -65,7 +79,6 @@ codec-whatttttttttttt/
       src/range_decoder.rs
       src/huffman.rs
       src/mdct.rs
-      src/entropy.rs
       src/ogg_page.rs
       src/ebml.rs
       src/flac_frame.rs
@@ -75,35 +88,38 @@ codec-whatttttttttttt/
       src/av1_obu.rs
       src/pcm.rs
       src/resample.rs
-      src/pixel.rs
-      src/metadata.rs
+      src/license.rs         # license gate (revision round 2026-11-08)
+      src/hw.rs              # hardware path traits + stub (revision round 2026-11-08)
+      src/resolution.rs      # AV1 level / VP9 profile limits, suggestions (revision round)
+      src/frame_pool.rs      # reusable frame buffers (revision round)
+      src/scaler.rs          # frame scaling (revision round)
+      src/quality.rs         # Lossless / Hi-Res Lossless labels (revision round)
+      src/dither.rs          # TPDF dither, noise shaping (revision round)
       src/error.rs
       src/limits.rs
-      tests/
-      benches/
-      fuzz/
-    codec-whatttttttttttt-ffi/
+      src/frame.rs           # Frame/Packet/Metadata/PixelFormat (no separate metadata.rs)
+      tests/                 # integration tests, incl. tests/data/ vectors
+      examples/              # bench.rs and the decode examples (no benches/ directory)
+      fuzz/                  # cargo-fuzz targets (standalone crate, not in the workspace)
+    codec-whatttttttttttt-c/
       Cargo.toml
       src/lib.rs
-      cbindgen.toml
       include/codec_whatttttttttttt.h
+      include/codec_whatttttttttttt.hpp   # C++ RAII wrapper (no separate bindings/cpp/)
+    codec-whatttttttttttt-wasm/
+      Cargo.toml
+      src/lib.rs
     codec-whatttttttttttt-cli/
       Cargo.toml
       src/main.rs
   bindings/
-    cpp/
-      CMakeLists.txt
-      include/codec-whatttttttttttt/decoder.hpp
-      include/codec-whatttttttttttt/encoder.hpp
-      src/decoder.cpp
-      src/encoder.cpp
-      tests/decoder_test.cpp
     kotlin/
       build.gradle.kts
       settings.gradle.kts
+      src/main/kotlin/dev/codecwhat/Codec.kt
       src/main/kotlin/dev/codecwhat/Decoder.kt
       src/main/kotlin/dev/codecwhat/Encoder.kt
-      src/main/cpp/jni_decoder.cpp
+      src/main/cpp/jni_bridge.cpp
       src/test/kotlin/dev/codecwhat/DecoderTest.kt
     swift/
       Package.swift
@@ -130,40 +146,58 @@ codec-whatttttttttttt/
         src/index.ts
     python/
       pyproject.toml
-      src/codec_whatttttttttttt/__init__.py
-      src/codec_whatttttttttttt/decoder.py
-      src/codec_whatttttttttttt/encoder.py
-      src/codec_whatttttttttttt/__init__.pyi
-      src/codec_whatttttttttttt/decoder.pyi
-      tests/test_decoder.py
+      codec_whatttttttttttt/__init__.py
+      codec_whatttttttttttt/_ffi.py
+      codec_whatttttttttttt/__init__.pyi
+      tests/test_codec.py
     zig/
       build.zig
       build.zig.zon
-      src/main.zig
       src/decoder.zig
       examples/decode_wav.zig
   docs/
     DESIGN.md                # this file
-    API.md                   # generated from rustdoc + binding docs, checked in after v0.1
-    BUILD.md
     LIMITS.md
-    TEST_COVERAGE.md
-  tests/
-    data/                    # test vectors with origin + license notes in tests/data/README.md
-  examples/
-    decode_wav.rs
-    decode_flac.rs
-    transcode_opus_to_wav.rs
   .github/workflows/
     ci.yml
-    fuzz.yml
-    sanitizer.yml
+    sanitizer.yml            # fuzz + ASan/UBSan + Miri (no separate fuzz.yml)
 ```
+
+Layout corrections (2026-11-08 revision round — the tree above
+now matches the repository; the earlier tree promised files
+that do not exist):
+
+- `src/pixel.rs`, `src/metadata.rs`, and `src/entropy.rs` do
+  not exist and never landed. `Metadata` / `MetadataEntry`
+  live in `src/frame.rs`; pixel-format conversion was never
+  implemented (only the `PixelFormat` enum in `frame.rs`);
+  entropy coding lives in `huffman.rs` and `range_decoder.rs`
+  (plus the AV1 symbol decoder in `av1_frame.rs`).
+- The FFI crate is `codec-whatttttttttttt-c`, not
+  `codec-whatttttttttttt-ffi`, and there is no `cbindgen.toml`:
+  the header is maintained by hand (`include/
+  codec_whatttttttttttt.h`), and the C++ wrapper is
+  `include/codec_whatttttttttttt.hpp` in the same crate —
+  there is no `bindings/cpp/` directory.
+- `docs/API.md`, `docs/BUILD.md`, and `docs/TEST_COVERAGE.md`
+  do not exist; they were planned in section 10 and are still
+  unwritten. The docs that exist are `DESIGN.md` and
+  `LIMITS.md`, plus the per-binding READMEs.
+- Test vectors live in
+  `crates/codec-whatttttttttttt-core/tests/data/`, not in a
+  root `tests/` directory. Examples live in
+  `crates/codec-whatttttttttttt-core/examples/`; there is no
+  root `examples/` and no `benches/` directory — the benchmark
+  is `examples/bench.rs` inside the core crate, run by hand.
+- The WASM crate `codec-whatttttttttttt-wasm` was added in
+  Phase 10 and was missing from the earlier tree.
 
 Crate names:
 
 - `codec-whatttttttttttt-core`
-- `codec-whatttttttttttt-ffi`
+- `codec-whatttttttttttt-c` (the FFI crate; the Step 1 name
+  `codec-whatttttttttttt-ffi` was never used)
+- `codec-whatttttttttttt-wasm` (added in Phase 10)
 - `codec-whatttttttttttt-cli`
 
 Rust import name for the core crate is `codec_whatttttttttttt_core` (hyphens become underscores). C header is `codec_whatttttttttttt.h`. C++ namespace is `codec_whatttttttttttt`. Python package is `codec_whatttttttttttt`. Swift module is `CodecWhat`. Kotlin package is `dev.codecwhat`. TypeScript package is `@codec-whatttttttttttt/core`. These spellings are fixed in this design so bindings do not drift.
@@ -197,9 +231,9 @@ impl<'a> BitReader<'a> {
 
 Why a separate module: every parser depends on the same bound checks. A bug here affects every codec, so it gets its own property tests and fuzz target.
 
-### 3.2 `huffman` and `entropy`
+### 3.2 `huffman` and `range_decoder`
 
-Canonical Huffman table construction and decoding, and range decoding for VP9/AV1.
+Canonical Huffman table construction and decoding, and range decoding for VP9/AV1. There is no `entropy.rs`: the entropy work lives in `huffman.rs` and `range_decoder.rs` (plus the AV1 symbol decoder in `av1_frame.rs`).
 
 - `huffman.rs`: build from code lengths per RFC 9639 section 9.5 and Vorbis codebook setup. Rejects over-subscribed and incomplete tables unless the spec explicitly permits incompleteness for that codec. Maximum code length is enforced per codec.
 - `range_decoder.rs`: boolean decoder for VP9 (VP9 spec section 8.2) and AV1 symbol decoder (AV1 spec section 8.2). State is explicit, no global state. `read_symbol` returns `InvalidData` on exhausted input rather than looping.
@@ -215,11 +249,24 @@ pub fn mdct_inverse(input: &[f32], output: &mut [f32], window: &[f32]) -> Result
 
 Window selection and overlap-add live in the codec modules, not here. This keeps MDCT testable against known vectors without codec state.
 
-### 3.4 `pcm`, `resample`, `pixel`
+### 3.4 `pcm`, `resample`, and pixel formats
 
-- `pcm.rs`: PCM sample formats `I16`, `I24`, `F32`. Conversion is saturating, documented per format. No silent clipping beyond saturation, and saturation is counted only in diagnostics, not hidden.
+- `pcm.rs`: PCM sample formats `I16`, `I24`, `I32`, `F32`.
+  Conversion is saturating, documented per format. No silent
+  clipping beyond saturation, and saturation is counted only in
+  diagnostics, not hidden. `I32` (revision round 2026-11-08)
+  has a bit-exact `decode_i32_samples` / `encode_i32_samples`
+  pair, because the f32 pipeline rounds i32 to 24 significant
+  bits.
 - `resample.rs`: sample-rate conversion. Phase 1 provides linear interpolation only; the polyphase FIR resampler for the frame path is a later phase and is not claimed until it exists. Cutoff, taps, and delay are documented constants, not magic numbers.
-- `pixel.rs`: YUV420 (I420, NV12) to RGB24/RGBA conversion, and RGB to YUV420. Colour conversion uses BT.601 limited range by default, BT.709 full range as an explicit option. No implicit colour-space change: the caller passes `ColourSpace` and `ColourRange` explicitly.
+- Pixel conversion: **not implemented**. There is no `pixel.rs`
+  (see section 2, layout corrections). Only the `PixelFormat`
+  enum (`Yuv420`, `Rgb24`, `Rgba32`) exists, in `frame.rs`.
+  The Step 1 plan for YUV420↔RGB conversion (BT.601 limited
+  range by default, BT.709 full range as an explicit option) is
+  still a plan, not code. Frame *scaling* is implemented
+  separately in `scaler.rs` (section 3.8); it does not change
+  colour space.
 
 ### 3.5 Container parsing
 
@@ -243,9 +290,225 @@ Each codec module owns its own state machine and its own limits. Shared code liv
 ### 3.7 `byte_source`, `metadata`, `limits`, `error`
 
 - `byte_source.rs`: a minimal `Read` adapter (`BoundedReader`) that turns a streaming byte source into bounded slices for parsers. It never allocates an unbounded buffer. The caller sets a maximum buffered size. This is the module the Step 1 design called `io`, renamed before implementation per section 13 item 1.
-- `metadata.rs`: Vorbis comment, FLAC metadata blocks, MP4 `meta`/`ilst`, Matroska tags. Metadata values are UTF-8 validated or returned as bytes with an explicit `is_valid_utf8` flag. No lossy replacement of invalid text.
+- `frame.rs`: `Frame` / `Packet` / `Metadata` / `PixelFormat`.
+  There is no separate `metadata.rs`: `Metadata` and
+  `MetadataEntry` live here. There is no `pixel.rs`: pixel
+  conversion was never implemented, only the `PixelFormat`
+  enum (`Yuv420`, `Rgb24`, `Rgba32`).
 - `limits.rs`: single place for all hard limits (see section 6).
 - `error.rs`: the error enum (see section 5).
+
+### 3.8 Revision-round modules (2026-11-08): license gate, resolution, pool, scale, quality, dither
+
+- `license.rs`: `LicenseContext { licensee, license_type:
+  LicenseType::{Commercial, Evaluation, Internal}, license_id,
+  expires: u64, scope }` plus an in-memory audit log
+  (`AuditRecord { timestamp_secs, codec, license_id_masked,
+  granted, reason }`, ids masked to the first 4 characters +
+  `***`). `new()` rejects an empty licensee/scope or a
+  malformed id (8–64 ASCII letters, digits, or `-`) with
+  `InvalidArgument`. `validate(codec)` re-checks the format,
+  then expiry against `SystemTime` (chrono-free); malformed →
+  `InvalidArgument`, expired → `LicenseRequired`. No network
+  call, no hard-coded key, no bypass. The gate is a compliance
+  mechanism only; see `NOTICE`.
+- `hw.rs`: the hardware path for licensed codecs. Traits
+  `HardwareDecoder` / `HardwareEncoder` (`codec()`, `open(&mut
+  LicenseContext)`, `decode` / `encode`), `StubHardwareDecoder`
+  / `StubHardwareEncoder` (closed until `open` succeeds;
+  successful decode returns a 0×0 frame, successful encode an
+  empty packet — neither calls a real hardware API), and
+  `licensed_software_path_error` /
+  `licensed_feature_enabled`. Error rule: feature off →
+  `Unsupported`, feature on without a valid license →
+  `LicenseRequired`. `Codec::Aac` exists since the next phase
+  (AAC-LC software decode behind `licensed-aac`); there is
+  still no AAC hardware path and no AAC software encoder.
+  Features `licensed-avc-hevc` / `licensed-aac`
+  are off by default (`default = []` in the core `Cargo.toml`).
+- `resolution.rs`: `FrameSize` (non-zero sides, at most 8192),
+  `Av1Level` with the 14 defined levels of AV1 spec Annex A
+  §10.3, `av1_level` / `validate_av1_frame` /
+  `validate_av1_sequence_header` / `minimum_av1_level`,
+  `Vp9ProfileLimits` / `vp9_profile_limits` /
+  `validate_vp9_frame` / `validate_vp9_frame_header` (VP9 spec
+  v0.6 has no level system: profiles 0–3 constrain bit depth
+  and chroma subsampling only; frame size is bounded by the
+  library 8192 limit), and `suggest_av1` / `suggest_vp9`
+  returning `EncodingSuggestion { bitrate_kbps_min,
+  bitrate_kbps_max, crf }` — suggestions computed from pixel
+  count, not spec values. Level 5.2 (`seq_level_idx` 14) has
+  `max_display_rate = None`: its display rate is unverified
+  against the spec table and is not checked — cần xác minh.
+- `frame_pool.rs`: `FramePool` (`new(max_frames)` /
+  `with_total_bytes`, `checkout` / `checkin`, `stats()` →
+  `FramePoolStats`), `frame_bytes`, `plane_bytes`,
+  `bytes_per_sample` (8-bit: 1 byte/sample; 10/12-bit: 2).
+  Checkout reuses an idle frame of the same shape or allocates
+  a fresh one, subject to the 64 MiB per-decode-call cap
+  (`MAX_ALLOCATION_BYTES`): an 8K YUV420 8-bit frame is
+  49,766,400 bytes and fits; 10-bit 8K is 99,532,800 bytes and
+  returns `AllocationLimit` by design — the cap was deliberately
+  not raised in this round.
+- `scaler.rs`: `ScaleFilter::{Bilinear, Bicubic, Lanczos3}`
+  and `scale_frame`. All three filters are implemented for
+  real: bilinear (2-tap tent), bicubic Catmull-Rom (4-tap),
+  Lanczos-3 (sinc×sinc, 6-tap); the kernel is widened on
+  downscale against aliasing, weights are renormalised, and
+  taps are clamped to the plane bounds. YUV420 chroma scales
+  at half resolution; colour space, range, and timestamp carry
+  over. The input frame is not modified.
+- `quality.rs`: `QualityParams { lossless, bits_per_sample,
+  sample_rate }` and `classify_quality() ->
+  Option<QualityLabel::{Lossless, HiResLossless}>`. Lossless is
+  lossless at most 16-bit / 48 kHz; Hi-Res Lossless is lossless
+  above that, at most 24-bit / 192 kHz; anything else is `None`.
+  The labels are commercial labels computed from measured
+  parameters, not formats and not codec names.
+- `dither.rs`: `DitherOptions { dither, noise_shaping, seed }`,
+  `quantize_i24_to_i16`, `quantize_f32_to_i16` (via the 24-bit
+  path, so callers holding original 24-bit samples should
+  prefer the i24 entry point). TPDF noise comes from a seeded
+  xorshift64 written here (no `rand` dependency; equal seeds
+  give equal output; seed 0 falls back to a fixed non-zero
+  constant); noise shaping is first-order error feedback.
+  `pcm.rs` also gains `PcmFormat::I32` with bit-exact
+  `decode_i32_samples` / `encode_i32_samples`, and
+  `wav_header.rs` maps WAV tag (1, 32) to `I32` — the f32
+  pipeline rounds i32 to 24 significant bits and cannot carry
+  i32 exactly.
+
+### 3.9 Next-phase modules (2026-11-08/09): passthrough, MP3/AAC/ALAC, bitrate, resampler, DSD
+
+- `mpeg_ts.rs`: MPEG-TS demux/mux (`TsDemuxer`, `TsMuxer`,
+  `TsStreamStats`). Parses PAT/PMT (every program's PMT),
+  assembles PES per PID, reads PCR, checks continuity
+  counters; a continuity gap drops the partial PES. AVC/HEVC/
+  AAC stream types yield packets as passthrough behind the
+  license gate; MP3 stream types 0x03/0x04 yield packets
+  since the final round. The muxer writes PAT/PMT once,
+  then one PES per `packet()` call.
+- `adts_frame.rs`: the single ADTS header parser in the
+  crate (`parse_adts_header`, `verify_adts_frame`,
+  `AdtsDemuxer`, `write_adts_frame`, `adts_crc16`,
+  `AdtsHeader` / `AdtsFrame`). `aac_frame.rs` delegates to
+  it (see below).
+- `aiff_chunk.rs`: AIFF/AIFF-C demux/mux (`parse_aiff`,
+  `AiffDemuxer`, `write_aiff`, `write_extended_float`).
+  COMM/SSND/MARK/COMT/FVER; AIFF-C `NONE`/`sowt` only.
+- `id3_tag.rs`: ID3v1/v2 read/write (`parse_id3`,
+  `parse_id3v1`, `write_id3v1`, `write_id3v2`, `Id3Tag`).
+- `mp4_tag.rs`: MP4 `meta`/`ilst` tags (`parse_mp4_tags`,
+  `parse_mp4_metadata`); text, integer, track/disk, genre,
+  cover art (kept raw).
+- `vorbis_comment.rs`: strict Vorbis comment packet parse /
+  write with case-insensitive key lookup. The lenient header
+  parser in `vorbis_setup.rs` is untouched.
+- `mp3_frame.rs`, `mp3_huffman.rs`, `mp3_synth.rs`,
+  `mp3_tables.rs`: MP3 Layer III decode (`Mp3FrameHeader`,
+  `Mp3Decoder`). Tables are from minimp3 (CC0). Layer I/II
+  and intensity stereo are not verified (see
+  `docs/LIMITS.md`); CBR encode is in `mp3_encode.rs` (final
+  round), VBR/ABR are `Unsupported`.
+- `aac_frame.rs`, `aac_huffman.rs`, `aac_tables.rs`: AAC-LC
+  raw-data-block decode (`AacDecoder`, `AacConfig`,
+  `parse_audio_specific_config`). `parse_adts_header` is a
+  thin wrapper over `adts_frame::parse_adts_header` that
+  adds the LC-only check, the channel-count mapping, and
+  the frame-fits-in-input check. CCE is unverified, TNS has
+  no measured fixture, HE-AAC/SBR/LTP are `Unsupported`.
+- `alac_frame.rs`, `alac_predictor.rs`: ALAC decode
+  (`decode_alac_frame`, `decode_alac_audio_frame`,
+  `parse_alac_config`), bit-exact vs ffmpeg. No license
+  gate. CCE/PCE are `Unsupported`.
+- `bitrate.rs`: `BitrateMode::{Cbr, Vbr(u8), Abr}` and
+  per-codec validation (`BitrateCodec::from_codec`,
+  `validate_for`); Opus only at 8/12/16/24/48 kHz.
+- `polyphase.rs`: windowed-sinc polyphase resampler
+  (`PolyphaseResampler`, `resample_polyphase`). Kaiser
+  window (A = 90 dB), 128 taps/phase, 2048-tap prototype
+  floor. Stateless per call; see `docs/LIMITS.md` for the
+  edge-transient rule. `resample.rs` gains `ResampleMethod`
+  (linear stays the default).
+- `dsd_stream.rs`, `dsd_decimator.rs`,
+  `dsd_coefficients.rs`, `dop.rs`: DSF/DFF demux
+  (`DsdDemuxer`, `DsdHeader`), DSD-to-PCM decimation
+  (`DsdDecimator`, `DsdLevel`), decimation/resample taps,
+  and DoP packing (`pack_dop`, `unpack_dop`). DoP is
+  DSD64/128 only. PCM-to-DSD is in `dsd_modulator.rs`
+  (final round).
+- Passthrough (in `mp4_box.rs`, `matroska.rs`,
+  `mpeg_ts.rs`, `demux.rs`, `hw.rs`): MP4 `avc1`/`hev1`/
+  `mp4a` and Matroska `V_MPEG4/ISO/AVC`,
+  `V_MPEGH/ISO/HEVC`, `A_AAC` parse as passthrough tracks
+  with `codec_private` kept; the demuxer holds an
+  `Option<LicenseContext>` validated eagerly by
+  `set_license_context`, and only `next_packet` refuses
+  licensed packets (`hw::passthrough_allowed`).
+
+### 3.10 Final-round modules (2026-11-09): small items, encoders, PCM→DSD, CELT, VP9, AV1
+
+- `flac_frame.rs` (extended): 20/24-bit and >2-channel
+  decode (`encode_flac_frame_wide` is the encoder side);
+  `FlacEncoder::with_bits_per_sample` /
+  `encode_i32` encode at 16/20/24 bits. 32-bit encode is
+  intentionally not done.
+- `vorbis_setup.rs` / `vorbis_packet.rs` (extended):
+  Vorbis floor type 0 header parse + packet decode
+  (verified on a synthetic stream only — no real floor-0
+  file exists).
+- `mp3_encode.rs`: MP3 Layer III CBR encode (`Mp3Encoder`:
+  MPEG-1 64/96/128/320 kbps, MPEG-2/2.5 64/96/128; long
+  blocks only, plain stereo, no bit reservoir; one frame of
+  encoder delay, tail on `flush()`). VBR/ABR are
+  `Unsupported`.
+- `aac_encode.rs`: AAC-LC encode (`AacEncoder`: MDCT +
+  sine window 1024, one scalefactor per frame, codebook
+  pairs 5/7/9/11 by exact bit cost, SCE/CPE + ADTS).
+  CBR/ABR/VBR. The gate is checked in `AacEncoder::new`
+  exactly like `Decoder::from_aac_config`: feature off →
+  `Unsupported`, no/expired license → `LicenseRequired`.
+- `alac_encode.rs`: ALAC lossless encode (`AlacEncoder`:
+  16/24-bit, 1–8 channels, frames 1–4096), bit-exact
+  round-trip. 20/32-bit encode is intentionally
+  unsupported.
+- `dsd_modulator.rs`: PCM→DSD delta-sigma modulation
+  (`DsdModulator`: CIFB order-5, NTF
+  `((1−z⁻¹)/(1−0.85·z⁻¹))⁵`, streaming `feed()` /
+  `flush()`, `write_dsf` / `write_dff`). DSD64/128/256/512.
+  Not realtime on this VM; see `docs/LIMITS.md`.
+- `celt_reconstruct.rs`: Opus CELT sample reconstruction
+  (`CeltDecoder`, `celt_end_band`): band-energy decode, TF
+  resolution, bit allocation, PVQ shape decode (CWRS),
+  denormalisation, anti-collapse, inverse MDCT +
+  overlap-add, comb-filter postfilter, de-emphasis. 22
+  tables from the RFC 6716 Appendix A reference, each with
+  provenance in a comment. SILK/Hybrid stay `Unsupported`.
+- `vp9_token.rs`, `vp9_predict.rs`, `vp9_loopfilter.rs`,
+  `vp9_reconstruct.rs`: VP9 reconstruction
+  (`reconstruct_vp9_frame`, `Vp9ReconstructionState`):
+  token/coefficient decode with the default prob tables
+  (verified vs libvpx), intra (all 10 modes) + inter
+  prediction + motion compensation, loop filter (§8.8).
+  Keyframes decode bit-exactly; inter frames are not
+  pixel-correct and `Decoder` refuses them.
+- `av1_tile.rs`, `av1_intra.rs`, `av1_reconstruct.rs`:
+  AV1 tile decode + intra reconstruction
+  (`reconstruct_av1_frame_obu`, `reconstruct_av1_keyframe`):
+  partition walk, intra modes, inverse transforms,
+  dequant. No pixels yet: coefficient decode needs the
+  default coefficient CDF tables (spec §9.3) and returns
+  `Unsupported(COEFFICIENT_GAP)`. Intra block copy, loop
+  filter, CDEF, and loop restoration are not implemented.
+- `decoder.rs` / `encoder.rs` (wiring): `Decoder` now
+  decodes Opus CELT, VP9 keyframes, and AV1 (coefficient-gap
+  `Unsupported`); `Encoder` now encodes MP3 (CBR), AAC-LC
+  (gated, via `EncoderConfig.license`), ALAC (16/24-bit),
+  DSD (raw DSF-layout bytes, via `EncoderConfig.dsd_level`),
+  and FLAC at 16/20/24-bit (via
+  `EncoderConfig.bits_per_sample`). `Encoder::flush` drains
+  the MP3 tail queue and the DSD tail.
+  `BitrateCodec::from_codec` now maps `Codec::Mp3`.
 
 ## 4. Public API
 
@@ -263,6 +526,13 @@ pub enum Codec {
     Vorbis,
     Vp9,
     Av1,
+    /// H.264/AVC: licensed, hardware only, never software.
+    /// `Decoder::decode` / `Encoder::encode` refuse it
+    /// (`Unsupported` with the feature off, `LicenseRequired`
+    /// with it on). Added in the 2026-11-08 revision round.
+    Avc,
+    /// H.265/HEVC: same gate as `Avc`.
+    Hevc,
 }
 
 pub struct DecoderConfig {
@@ -368,33 +638,37 @@ pub fn convert_pixel(input: &VideoFrame, target: PixelFormat, colour: ColourSpac
 The FFI crate exposes only opaque handles and plain C types. No Rust type crosses the boundary. Every function returns an error code; output is written through an out-pointer only on success.
 
 ```c
-typedef struct cw_decoder cw_decoder_t;
-typedef struct cw_encoder cw_encoder_t;
-typedef struct cw_demuxer cw_demuxer_t;
-
-typedef enum cw_error {
-    CW_OK = 0,
-    CW_ERROR_IO = 1,
-    CW_ERROR_INVALID_DATA = 2,
-    CW_ERROR_TRUNCATED = 3,
-    CW_ERROR_UNSUPPORTED = 4,
-    CW_ERROR_OVERFLOW = 5,
-    CW_ERROR_OUT_OF_MEMORY = 6,
-    CW_ERROR_INVALID_ARGUMENT = 7
-} cw_error_t;
-
-cw_error_t cw_decoder_new(const cw_decoder_config_t *config, cw_decoder_t **out);
-cw_error_t cw_decoder_decode(cw_decoder_t *decoder, const uint8_t *data, size_t len, cw_frame_t *out);
-void cw_decoder_free(cw_decoder_t *decoder);
-const char *cw_error_string(cw_error_t error);
+typedef int32_t codec_error_t;
+#define CODEC_OK 0
+#define CODEC_ERR_IO 1
+#define CODEC_ERR_INVALID_DATA 2
+#define CODEC_ERR_TRUNCATED 3
+#define CODEC_ERR_UNSUPPORTED 4
+#define CODEC_ERR_OVERFLOW 5
+#define CODEC_ERR_ALLOCATION_LIMIT 6
+#define CODEC_ERR_INVALID_ARGUMENT 7
+#define CODEC_ERR_LICENSE_REQUIRED 8
 ```
 
-Header generation: `cbindgen` from the FFI crate, checked into `crates/codec-whatttttttttttt-ffi/include/codec_whatttttttttttt.h`. The checked-in header is regenerated in CI and must match, otherwise CI fails. This prevents drift between Rust and C.
+`CODEC_ERR_LICENSE_REQUIRED` (8) was added in the 2026-11-08
+revision round for `Error::LicenseRequired { codec }`; code 6 is
+the allocation limit, not an out-of-memory code. The canonical
+header is `crates/codec-whatttttttttttt-c/include/
+codec_whatttttttttttt.h` (maintained by hand, not generated by
+cbindgen — see section 2, layout corrections).
+
+codec_error_t codec_decoder_from_wav_header(const uint8_t *header, size_t len, codec_decoder_t **out);
+codec_error_t codec_decoder_decode(codec_decoder_t *decoder, const uint8_t *packet, size_t len, uint64_t timestamp_us, const codec_audio_frame_t **out_frame);
+void codec_decoder_free(codec_decoder_t *decoder);
+const char *codec_error_string(codec_error_t code);
+```
+
+Header: the canonical header is maintained by hand in `crates/codec-whatttttttttttt-c/include/codec_whatttttttttttt.h` (no cbindgen, no `codec-whatttttttttttt-ffi` crate — see section 2, layout corrections). The Swift vendored copy must stay identical; CI diffs them. This prevents drift between Rust and C.
 
 Memory ownership across FFI:
 
 - The caller allocates input buffers and retains ownership.
-- The decoder allocates output frames and transfers ownership to the caller through `cw_frame_t`; the caller releases with `cw_frame_free`.
+- A decoded frame (and an encoded packet) is borrowed from its decoder/encoder and stays valid only until the next call on the same handle or its free — the caller must copy before the next call. Buffers the library allocates (one-shot FLAC encode output) are released with `codec_free`; opaque handles with the matching `codec_*_free`.
 - A null handle, null data pointer with non-zero length, or null out-pointer is `CW_ERROR_INVALID_ARGUMENT`, not a crash.
 - No function retains a pointer to caller memory after it returns.
 
@@ -438,6 +712,15 @@ pub enum Error {
 
     #[error("invalid argument: {0}")]
     InvalidArgument(&'static str),
+
+    /// A licensed codec was requested without a valid license.
+    /// Added in the 2026-11-08 revision round (`license.rs`,
+    /// `hw.rs`). Feature off for that codec means the caller
+    /// gets `Unsupported` instead; this variant means the gate
+    /// exists and is closed (no license, malformed license is
+    /// `InvalidArgument`, expired license is this variant).
+    #[error("license required for codec {codec}")]
+    LicenseRequired { codec: &'static str },
 }
 ```
 
@@ -447,7 +730,7 @@ Rules:
 - A CRC mismatch is `InvalidData`, not a warning.
 - An unsupported codec feature returns `Unsupported` with the feature name, not a generic failure.
 - Errors are not swallowed: a helper that maps an error must preserve the offset and detail, or add context explicitly.
-- `Display` output is stable enough for tests to match on variant, not on exact string, except for `cw_error_string` in C.
+- `Display` output is stable enough for tests to match on variant, not on exact string, except for `codec_error_string` in C.
 
 ## 6. Memory model and limits
 
@@ -593,7 +876,7 @@ Each phase is complete, compiles, and passes its tests before the next phase sta
 ### Phase 10 — Bindings, in order
 
 1. C ABI + C++ wrapper.
-2. Python (PyO3).
+2. Python (ctypes, not PyO3 — see section 2, layout corrections).
 3. Kotlin JNI.
 4. Swift SwiftPM.
 5. TypeScript WASM, then React Native JSI/TurboModule.
@@ -605,8 +888,31 @@ Each binding has its own README, runnable example, and tests. No binding ships w
 
 - `cargo-fuzz` targets for every parser (`bitreader`, `ogg_page`, `ebml`, `mp4_box`, `flac_frame`, `opus_packet`, `vorbis_setup`, `vp9_bitstream`, `av1_obu`).
 - Property tests: round-trip, resample identity at same rate, pixel conversion round-trip YUV420 -> RGB -> YUV420 within documented tolerance.
-- Benchmarks: `benches/decode_flac.rs`, `benches/decode_opus.rs`, `benches/resample.rs`, `benches/pixel.rs`.
+- Benchmarks: the internal bench binary `examples/bench.rs` in the core crate (no `benches/` directory; the Step 1 plan for `benches/decode_*.rs` was never implemented as separate files).
 - Sanitizers: ASan/UBSan for C/C++/JNI, Miri for Rust.
+
+### Next phase (2026-11-08/09) — passthrough, MP3/AAC/ALAC, bitrate, resampler, DSD
+
+- Passthrough AVC/HEVC/AAC after the license gate (MP4
+  `avc1`/`hev1`/`mp4a`, Matroska `V_MPEG4/ISO/AVC`,
+  `V_MPEGH/ISO/HEVC`, `A_AAC`); MPEG-TS demux/mux; ADTS
+  demux/mux + CRC-16; AIFF/AIFF-C; ID3v1/v2; MP4 tags;
+  Vorbis comment.
+- MP3 Layer III decode (ISO full compliance, measured);
+  AAC-LC decode behind `licensed-aac`; ALAC decode
+  bit-exact vs ffmpeg. No encoder for any of the three.
+- `BitrateMode` validation; windowed-sinc polyphase
+  resampler; DSD DSF/DFF to PCM + DoP (DSD64/128).
+- Tests: `tests/audio_matrix.rs` (lossless bit-exact rows,
+  sample matrix §6 round-trips, lossy bitrate rows at
+  64/96/128/320 kbps, Opus `Unsupported`, encode refusals),
+  four new fuzz targets (`fuzz_mp3`, `fuzz_adts`,
+  `fuzz_dsf`, `fuzz_dff`), `fuzz_mp4` extended with
+  passthrough seeds.
+- Commits: `feat(passthrough)`, `feat(mp3)`, `feat(aac)`,
+  `feat(alac)`, `feat(bitrate)`, `feat(resampler)`,
+  `feat(dsd)`, `fix(polyphase)`, `fix(adts)`,
+  `fix(clippy)`, `fix(encoder)` (see `CHANGELOG.md`).
 
 ## 9. Testing, CI, and quality gates
 
@@ -653,8 +959,9 @@ If code cannot be run here (for example, a Kotlin or Swift toolchain is missing 
 ## 10. Documentation
 
 - `README.md`: install, minimal example, supported codec table, status, links to docs. No advertising language.
-- `docs/API.md`: public API per language, generated from rustdoc and checked after each phase.
-- `docs/BUILD.md`: build per platform, toolchain versions, what is verified in this environment and what is not.
+- `NOTICE`: license-gate and patent-status notes for H.264/H.265/AAC, MP3, and ALAC (added in the 2026-11-08 revision round).
+- `docs/API.md`: public API per language, generated from rustdoc and checked after each phase. **Not written yet** — see section 2, layout corrections.
+- `docs/BUILD.md`: build per platform, toolchain versions, what is verified in this environment and what is not. **Not written yet** — see section 2, layout corrections.
 - `docs/LIMITS.md`: the limits table from section 6, the VP9/AV1 decode subsets, and known limitations as issue notes.
 - `CHANGELOG.md`: Keep a Changelog format. Every phase adds an entry.
 - `CONTRIBUTING.md`: how to add a codec, how to add a test vector, commit format.
@@ -680,6 +987,7 @@ If code cannot be run here (for example, a Kotlin or Swift toolchain is missing 
 9. Phase 6 + Phase 7 implemented together, 2026-11-08. WebM/Matroska and MP4 demux are complete (see `docs/LIMITS.md` for the exact limits); AV1 is parser-only (OBU + sequence header + frame header + tile-group framing; reconstruction returns `Unsupported`); see `CHANGELOG.md` and `docs/LIMITS.md`.
 10. Phase 8 + Phase 9 are pre-authorized by Hoàng (2026-11-08 16:29): after Phase 6+7, do VP9 decode subset + basic encode next, without asking again. Phase 8 and Phase 9 are complete; see `CHANGELOG.md` and `docs/LIMITS.md`.
 11. Phase 10 + Phase 11 are pre-authorized by Hoàng (2026-11-08 17:39): after Phase 8+9, do the remaining phases (bindings, then hardening) without asking again, and report a final summary only when all 12 phases are done. Phase 10 and Phase 11 are complete; see `CHANGELOG.md` and `docs/LIMITS.md`. All 12 phases are now complete.
+12. Revision round (2026-11-08, after all 12 phases): the license gate, resolution limits, frame pool, scaler, quality labels, TPDF dither, and I32 PCM from section 3.8. Rules: no H.264/H.265 software code ever existed, so none was removed; the gate is a compliance mechanism only (see `NOTICE`); the 64 MiB per-call allocation cap is deliberately not raised for 10-bit 8K; demux still rejects AVC/HEVC/AAC tracks with `Unsupported` (no passthrough behind the gate yet); AV1 level 5.2 display rate is unverified and not checked. See `CHANGELOG.md` (Unreleased, revision round) and `docs/LIMITS.md`.
 
 Phase 10 + 11 API notes (recorded during implementation, not a silent change):
 

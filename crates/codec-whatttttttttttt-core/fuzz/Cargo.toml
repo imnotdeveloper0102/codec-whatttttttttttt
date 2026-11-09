@@ -51,3 +51,19 @@ path = "fuzz_targets/fuzz_opus.rs"
 [[bin]]
 name = "fuzz_vorbis"
 path = "fuzz_targets/fuzz_vorbis.rs"
+
+[[bin]]
+name = "fuzz_mp3"
+path = "fuzz_targets/fuzz_mp3.rs"
+
+[[bin]]
+name = "fuzz_adts"
+path = "fuzz_targets/fuzz_adts.rs"
+
+[[bin]]
+name = "fuzz_dsf"
+path = "fuzz_targets/fuzz_dsf.rs"
+
+[[bin]]
+name = "fuzz_dff"
+path = "fuzz_targets/fuzz_dff.rs"

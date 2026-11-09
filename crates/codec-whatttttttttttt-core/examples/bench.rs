@@ -1,4 +1,4 @@
-//! Internal benchmark for FLAC/Vorbis decode and FLAC encode.
+//! Internal benchmark for FLAC/Vorbis/DSD decode and FLAC encode.
 //!
 //! Not criterion: a plain binary using `Instant`, so the numbers
 //! come from this machine with no extra dependency. The fixtures
@@ -22,8 +22,9 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use codec_whatttttttttttt_core::{
-    decode_flac_frame, encode_flac_stream, parse_flac_stream, Codec, Decoder, Error, Frame,
-    OggDemuxer, VorbisSetup,
+    decode_flac_frame, encode_flac_stream, parse_flac_stream, scale_frame, Codec, Decoder,
+    DsdDecimator, DsdDemuxer, Error, Frame, FramePool, OggDemuxer, PixelFormat, ScaleFilter,
+    VideoFrame, VorbisSetup,
 };
 
 const DATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data");
@@ -106,6 +107,51 @@ fn vorbis_decode_all(
     Ok(frames)
 }
 
+/// Collect all packets of a DSD fixture; returns the header
+/// and the packets.
+fn dsd_packets(
+    bytes: Vec<u8>,
+) -> Result<
+    (
+        codec_whatttttttttttt_core::DsdHeader,
+        Vec<codec_whatttttttttttt_core::Packet>,
+    ),
+    Error,
+> {
+    let mut demuxer = DsdDemuxer::new(Cursor::new(bytes))?;
+    let header = demuxer.header().clone();
+    let mut packets = Vec::new();
+    while let Some(packet) = demuxer.next_packet()? {
+        packets.push(packet);
+    }
+    Ok((header, packets))
+}
+
+/// Decode a whole DSD fixture (packets already collected by the
+/// caller) through a fresh decimator; returns the frame count.
+/// The demuxing is done once by the caller, so the number
+/// measures the decimation (and the rational resample for the
+/// 48 kHz family), not the header parse or the file read.
+fn dsd_decode_all(
+    header: &codec_whatttttttttttt_core::DsdHeader,
+    packets: &[codec_whatttttttttttt_core::Packet],
+    target_rate: u32,
+) -> Result<usize, Error> {
+    let mut decimator = DsdDecimator::new(
+        header.sample_rate,
+        header.channels,
+        target_rate,
+        header.layout(),
+    )?;
+    let channels = header.channels as usize;
+    let mut frames = 0usize;
+    for packet in packets {
+        frames += decimator.feed(&packet.data)?.len() / channels;
+    }
+    frames += decimator.flush()?.len() / channels;
+    Ok(frames)
+}
+
 /// Run `run` 3 warmup times, then 10 timed times; return the
 /// median duration.
 fn median_time<F: FnMut() -> Result<(), Error>>(mut run: F) -> Result<Duration, Error> {
@@ -120,6 +166,37 @@ fn median_time<F: FnMut() -> Result<(), Error>>(mut run: F) -> Result<Duration, 
     }
     times.sort_unstable();
     Ok(times[5])
+}
+
+/// DSD decode benchmarks: 0.1 s of stereo from the DSF
+/// fixtures. The packets are collected once; only the
+/// decimation is timed, with a fresh decimator (fresh filter
+/// state) per iteration. The 192 kHz case exercises the 48 kHz
+/// family: decimate to 705.6 kHz, then the rational resample
+/// to 192 kHz.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "bench fixtures hold at most a few hundred thousand frames, exactly representable in f64"
+)]
+fn bench_dsd() -> Result<(), Error> {
+    for (name, target_rate) in [
+        ("dsf_dsd128_stereo.dsf", 176_400u32),
+        ("dsf_dsd512_stereo.dsf", 352_800),
+        ("dsf_dsd256_stereo.dsf", 192_000),
+    ] {
+        let (header, packets) = dsd_packets(data(name)?)?;
+        let frames = dsd_decode_all(&header, &packets, target_rate)?;
+        let audio_seconds = frames as f64 / f64::from(target_rate);
+        let time = median_time(|| dsd_decode_all(&header, &packets, target_rate).map(|_| ()))?;
+        println!(
+            "dsd {name:>24} -> {target_rate:>7} Hz {:>8.1} us  {:>6.1}x realtime  ({} frames, {}ch)",
+            time.as_micros(),
+            audio_seconds / time.as_secs_f64(),
+            frames,
+            header.channels,
+        );
+    }
+    Ok(())
 }
 
 #[allow(
@@ -189,6 +266,57 @@ fn run() -> Result<(), Error> {
         encoded.len(),
         encode_frames,
     );
+
+    // 8K scale + pool. A separate benchmark, NOT run in CI: the
+    // `rust` job in .github/workflows/ci.yml runs fmt, clippy and
+    // tests only, with no `cargo bench` step. Run it manually
+    // with `cargo run --release -p codec-whatttttttttttt-core
+    // --example bench`. Each filter is timed once (not the
+    // median of 10) because one 8K resample already costs
+    // hundreds of millions of tap evaluations. One 8K YUV 4:2:0
+    // 8-bit frame is 49,766,400 bytes; the pool section reuses
+    // that one buffer instead of reallocating it.
+    let mut pool = FramePool::new(2);
+    let mut frame_8k = pool.checkout(7680, 4320, PixelFormat::Yuv420, 8)?;
+    for (index, value) in frame_8k.planes[0].iter_mut().enumerate() {
+        *value = ((index % 7680) * 255 / 7680) as u8;
+    }
+    for filter in [
+        ScaleFilter::Bilinear,
+        ScaleFilter::Bicubic,
+        ScaleFilter::Lanczos3,
+    ] {
+        let name = match filter {
+            ScaleFilter::Bilinear => "bilinear",
+            ScaleFilter::Bicubic => "bicubic",
+            ScaleFilter::Lanczos3 => "lanczos3",
+        };
+        let start = Instant::now();
+        let scaled: VideoFrame = scale_frame(&frame_8k, 3840, 2160, filter)?;
+        let elapsed = start.elapsed();
+        let pixels = u64::from(scaled.width) * u64::from(scaled.height);
+        println!(
+            "8k scale {name:>8} {:>8.1} ms  {:>6.1} MP/s out  (7680x4320 -> 3840x2160)",
+            elapsed.as_millis(),
+            pixels as f64 / elapsed.as_secs_f64() / 1_000_000.0,
+        );
+    }
+    let pool_start = Instant::now();
+    for _ in 0..10 {
+        let frame = pool.checkout(7680, 4320, PixelFormat::Yuv420, 8)?;
+        pool.checkin(frame);
+    }
+    let pool_elapsed = pool_start.elapsed();
+    let stats = pool.stats();
+    println!(
+        "8k pool      {:>8.1} us for 10 checkout/checkin rounds  ({} allocations, {} reuses)",
+        pool_elapsed.as_micros(),
+        stats.allocations,
+        stats.reuses,
+    );
+    pool.checkin(frame_8k);
+
+    bench_dsd()?;
     Ok(())
 }
 

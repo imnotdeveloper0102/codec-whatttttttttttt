@@ -12,9 +12,20 @@
 //! (faststart); samples are validated against the `mdat` ranges.
 //!
 //! Scope for Phase 6: sample entries `av01`, `vp09`, `Opus`, and
-//! `fLaC`. `mp4a` (AAC) and any other entry return `Unsupported`.
-//! FLAC-in-MP4 is parsed but has no test vector (ffmpeg cannot
-//! produce one), so it is marked unverified in `docs/LIMITS.md`.
+//! `fLaC`. FLAC-in-MP4 is parsed but has no test vector (ffmpeg
+//! cannot produce one), so it is marked unverified in
+//! `docs/LIMITS.md`.
+//!
+//! Passthrough (current round): sample entries `avc1`/`hev1`
+//! (AVC/HEVC, config in `avcC`/`hvcC`, ISO/IEC 14496-15) and
+//! `mp4a` (AAC, config in `esds`, ISO/IEC 14496-1) are parsed and
+//! their samples are returned as packets, gated by the license
+//! context (see `set_license_context`): without the feature or
+//! without a license, `next_packet` refuses the packet instead of
+//! yielding it. Packet data is the sample as stored (AVCC
+//! length-prefixed NAL units for AVC/HEVC, raw AAC frames for
+//! AAC); nothing is decoded here. M4A is MP4 carrying AAC (or
+//! ALAC), not a separate codec.
 
 use std::collections::HashSet;
 use std::io::Read;
@@ -23,6 +34,8 @@ use crate::byte_source::read_mp4_bytes;
 use crate::demux::{TrackInfo, TrackKind};
 use crate::error::{Error, Result};
 use crate::frame::{Codec, Metadata, Packet};
+use crate::hw::{licensed_feature_enabled, passthrough_allowed};
+use crate::license::LicenseContext;
 use crate::limits::{MAX_NESTING_DEPTH, MAX_SAMPLES_PER_TRACK, MAX_TRACKS};
 
 // Box types. Only the boxes this demuxer reads are listed; unknown
@@ -53,9 +66,14 @@ const BOX_VP09: [u8; 4] = *b"vp09";
 const BOX_OPUS: [u8; 4] = *b"Opus";
 const BOX_MP4A: [u8; 4] = *b"mp4a";
 const BOX_FLAC: [u8; 4] = *b"fLaC";
+const BOX_AVC1: [u8; 4] = *b"avc1";
+const BOX_HEV1: [u8; 4] = *b"hev1";
 const BOX_AV1C: [u8; 4] = *b"av1C";
 const BOX_VPCC: [u8; 4] = *b"vpcC";
 const BOX_DOPS: [u8; 4] = *b"dOps";
+const BOX_AVCC: [u8; 4] = *b"avcC";
+const BOX_HVCC: [u8; 4] = *b"hvcC";
+const BOX_ESDS: [u8; 4] = *b"esds";
 
 /// Header of one ISO BMFF box.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -354,6 +372,10 @@ pub struct Mp4Demuxer {
     position: usize,
     duration_us: Option<u64>,
     metadata: Metadata,
+    /// License context for passthrough of AVC/HEVC/AAC packets.
+    /// `None` until the caller sets one; packets of licensed
+    /// codecs are refused until then (see `next_packet`).
+    license: Option<LicenseContext>,
 }
 
 impl Mp4Demuxer {
@@ -468,13 +490,18 @@ impl Mp4Demuxer {
             });
         }
         let infos: Vec<TrackInfo> = tracks.drain(..).map(|track| track.info).collect();
+        // Tags are best-effort: a corrupt `meta`/`ilst` must not
+        // invalidate playable media, so a tag parse failure leaves
+        // the metadata empty instead of failing the demux.
+        let metadata = crate::mp4_tag::parse_mp4_metadata(bytes).unwrap_or_default();
         Ok(Self {
             tracks: infos,
             packets,
             packet_tracks,
             position: 0,
             duration_us,
-            metadata: Metadata::new(),
+            metadata,
+            license: None,
         })
     }
 
@@ -490,11 +517,47 @@ impl Mp4Demuxer {
         self.duration_us
     }
 
-    /// Container metadata. MP4 `udta`/`meta` is not parsed in Phase
-    /// 6, so this is always empty.
+    /// Container metadata from `meta`/`ilst`/`udta` (see
+    /// `mp4_tag`); empty when the file has no tags or its tags
+    /// are malformed.
     #[must_use]
     pub fn metadata(&self) -> &Metadata {
         &self.metadata
+    }
+
+    /// Sets the license context for passthrough of AVC/HEVC/AAC.
+    /// The license is validated eagerly for every licensed codec
+    /// the file carries, and is stored only when every check
+    /// passes; a failed check leaves the previous context (or
+    /// none) in place.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Unsupported` when the feature for a carried
+    /// licensed codec is off, `LicenseRequired` when the license
+    /// has expired, and `InvalidArgument` for a malformed
+    /// license.
+    pub fn set_license_context(&mut self, mut license: Option<LicenseContext>) -> Result<()> {
+        if let Some(context) = license.as_mut() {
+            let mut seen: Vec<Codec> = Vec::new();
+            for track in &self.tracks {
+                if matches!(track.codec, Codec::Avc | Codec::Hevc | Codec::Aac)
+                    && !seen.contains(&track.codec)
+                {
+                    seen.push(track.codec);
+                }
+            }
+            for codec in seen {
+                if !licensed_feature_enabled(codec) {
+                    return Err(Error::Unsupported(
+                        "mp4 passthrough for this codec is not enabled in this build",
+                    ));
+                }
+                context.validate(codec.name())?;
+            }
+        }
+        self.license = license;
+        Ok(())
     }
 
     /// Number of packets in the file.
@@ -504,18 +567,23 @@ impl Mp4Demuxer {
     }
 
     /// Returns the next packet in decode-timestamp order, or `None`
-    /// at end of stream.
+    /// at end of stream. Licensed packets are gated: without a
+    /// feature or without a license this returns `Unsupported` or
+    /// `LicenseRequired` instead of the packet, and the position
+    /// does not advance, so the caller can set a license and
+    /// retry.
     ///
     /// # Errors
     ///
-    /// This implementation never fails after construction; the
-    /// `Result` exists so a streaming demuxer can report read
-    /// errors here.
+    /// Returns `Unsupported` when the packet's codec needs a
+    /// feature that is off, and `LicenseRequired` when the codec
+    /// needs a license that was not set.
     pub fn next_packet(&mut self) -> Result<Option<Packet>> {
         if self.position >= self.packets.len() {
             return Ok(None);
         }
         let packet = self.packets[self.position].clone();
+        passthrough_allowed(packet.codec, self.license.is_some())?;
         self.position += 1;
         Ok(Some(packet))
     }
@@ -1219,11 +1287,255 @@ fn parse_sample_entry(bytes: &[u8], entry: &BoxHeader) -> Result<SampleEntry> {
                 channels: None,
             })
         }
-        BOX_MP4A => Err(Error::Unsupported(
-            "mp4a (aac) sample entry is not supported",
-        )),
+        BOX_AVC1 | BOX_HEV1 => {
+            // VisualSampleEntry, same layout as av01/vp09:
+            // 78 bytes of fields after the 8-byte entry header,
+            // then the config box (`avcC`/`hvcC`, ISO/IEC
+            // 14496-15). Samples are passed through as stored
+            // (AVCC length-prefixed NAL units); nothing here
+            // decodes them.
+            if entry.payload_len() < 78 {
+                return Err(Error::Truncated {
+                    needed: entry.data_start + 78,
+                    had: bytes.len(),
+                });
+            }
+            let width = u32::from(read_u16(bytes, entry.data_start + 24)?);
+            let height = u32::from(read_u16(bytes, entry.data_start + 26)?);
+            let mut codec_private: Vec<u8> = Vec::new();
+            let mut cursor = BoxCursor::new(bytes, entry.data_start + 78, entry.data_end)?;
+            while let Some(child) = cursor.next_header()? {
+                match child.box_type {
+                    BOX_AVCC | BOX_HVCC => {
+                        codec_private = bytes[child.data_start..child.data_end].to_vec();
+                    }
+                    _ => {}
+                }
+            }
+            if codec_private.is_empty() {
+                return Err(Error::InvalidData {
+                    offset: entry.offset,
+                    detail: "mp4 video sample entry has no codec configuration box",
+                });
+            }
+            // Config record version must be 1 (ISO/IEC 14496-15).
+            if codec_private[0] != 1 {
+                return Err(Error::InvalidData {
+                    offset: entry.offset,
+                    detail: "mp4 avcC/hvcC configuration version is not 1",
+                });
+            }
+            let codec = if entry.box_type == BOX_AVC1 {
+                Codec::Avc
+            } else {
+                Codec::Hevc
+            };
+            Ok(SampleEntry {
+                codec,
+                codec_id,
+                codec_private,
+                width: Some(width),
+                height: Some(height),
+                sample_rate: None,
+                channels: None,
+            })
+        }
+        BOX_MP4A => {
+            // AudioSampleEntry: 28 bytes of fields after the
+            // 8-byte entry header, then the `esds` box (ISO/IEC
+            // 14496-1). The channel count and sample rate come
+            // from the entry fields; the AudioSpecificConfig from
+            // `esds` is the codec-private data. M4A is MP4
+            // carrying AAC (or ALAC), not a codec of its own.
+            if entry.payload_len() < 28 {
+                return Err(Error::Truncated {
+                    needed: entry.data_start + 28,
+                    had: bytes.len(),
+                });
+            }
+            let channels = Some(u32::from(read_u16(bytes, entry.data_start + 16)?));
+            let sample_rate = Some(read_u32(bytes, entry.data_start + 24)? >> 16);
+            let mut codec_private: Vec<u8> = Vec::new();
+            let mut cursor = BoxCursor::new(bytes, entry.data_start + 28, entry.data_end)?;
+            while let Some(child) = cursor.next_header()? {
+                if child.box_type == BOX_ESDS {
+                    codec_private = parse_esds(bytes, &child)?;
+                }
+            }
+            if codec_private.is_empty() {
+                return Err(Error::InvalidData {
+                    offset: entry.offset,
+                    detail: "mp4a sample entry has no esds box",
+                });
+            }
+            Ok(SampleEntry {
+                codec: Codec::Aac,
+                codec_id,
+                codec_private,
+                width: None,
+                height: None,
+                sample_rate,
+                channels,
+            })
+        }
         _ => Err(Error::Unsupported("unsupported mp4 sample entry type")),
     }
+}
+
+/// Reads one descriptor tag + length from an `esds` box
+/// (ISO/IEC 14496-1): a tag byte, then a length in base-128
+/// (up to 4 bytes, high bit set on all but the last). Returns
+/// (tag, body length) and advances `pos` past the header.
+///
+/// # Errors
+///
+/// Returns `Truncated` when the descriptor runs past the box.
+fn read_esds_descriptor(data: &[u8], pos: &mut usize, end: usize) -> Result<(u8, usize)> {
+    let tag = *data.get(*pos).ok_or(Error::Truncated {
+        needed: *pos + 1,
+        had: data.len(),
+    })?;
+    *pos += 1;
+    let mut len: usize = 0;
+    for _ in 0..4 {
+        let byte = *data.get(*pos).ok_or(Error::Truncated {
+            needed: *pos + 1,
+            had: data.len(),
+        })?;
+        *pos += 1;
+        len = len
+            .checked_mul(128)
+            .and_then(|value| value.checked_add(usize::from(byte & 0x7F)))
+            .ok_or(Error::Overflow("esds descriptor length overflows"))?;
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    if *pos + len > end {
+        return Err(Error::Truncated {
+            needed: *pos + len,
+            had: data.len(),
+        });
+    }
+    Ok((tag, len))
+}
+
+/// Parses an `esds` box (ISO/IEC 14496-1) into the AAC
+/// `AudioSpecificConfig` bytes from its `DecoderSpecificInfo`
+/// (tag `0x05`). Only AAC (`objectTypeIndication 0x40`) is
+/// accepted; any other object type is `Unsupported`.
+///
+/// # Errors
+///
+/// Returns `Truncated` for a cut-short descriptor,
+/// `InvalidData` when the descriptor structure is wrong or
+/// there is no `DecoderSpecificInfo`, and `Unsupported` for a
+/// non-AAC object type.
+fn parse_esds(bytes: &[u8], esds: &BoxHeader) -> Result<Vec<u8>> {
+    if esds.payload_len() < 4 {
+        return Err(Error::Truncated {
+            needed: esds.data_start + 4,
+            had: bytes.len(),
+        });
+    }
+    let end = esds.data_end;
+    let mut pos = esds.data_start + 4;
+    let (tag, len) = read_esds_descriptor(bytes, &mut pos, end)?;
+    if tag != 0x03 {
+        return Err(Error::InvalidData {
+            offset: esds.offset,
+            detail: "esds box does not start with an ES_Descriptor",
+        });
+    }
+    let es_end = pos + len;
+    if es_end > end {
+        return Err(Error::Truncated {
+            needed: es_end,
+            had: bytes.len(),
+        });
+    }
+    // ES_Descriptor body: ES_ID(2), flags(1), then optional
+    // fields the flags select.
+    if pos + 3 > es_end {
+        return Err(Error::Truncated {
+            needed: pos + 3,
+            had: bytes.len(),
+        });
+    }
+    pos += 2;
+    let flags = bytes[pos];
+    pos += 1;
+    if flags & 0x80 != 0 {
+        pos += 2;
+    }
+    if flags & 0x40 != 0 {
+        let url_len = usize::from(*bytes.get(pos).ok_or(Error::Truncated {
+            needed: pos + 1,
+            had: bytes.len(),
+        })?);
+        pos += 1 + url_len;
+    }
+    if flags & 0x20 != 0 {
+        pos += 2;
+    }
+    if pos > es_end {
+        return Err(Error::Truncated {
+            needed: pos,
+            had: bytes.len(),
+        });
+    }
+    // Nested descriptors: DecoderConfigDescriptor (0x04) holds
+    // the object type and the DecoderSpecificInfo (0x05).
+    while pos < es_end {
+        let (inner_tag, inner_len) = read_esds_descriptor(bytes, &mut pos, es_end)?;
+        let inner_end = pos + inner_len;
+        if inner_end > es_end {
+            return Err(Error::Truncated {
+                needed: inner_end,
+                had: bytes.len(),
+            });
+        }
+        if inner_tag == 0x04 {
+            // DecoderConfigDescriptor body: objectType(1),
+            // streamType/upStream/reserved(1), bufferSizeDB(3),
+            // maxBitrate(4), avgBitrate(4) = 13 bytes.
+            if inner_len < 13 {
+                return Err(Error::InvalidData {
+                    offset: esds.offset,
+                    detail: "esds DecoderConfigDescriptor is too short",
+                });
+            }
+            if bytes[pos] != 0x40 {
+                return Err(Error::Unsupported(
+                    "mp4a with a non-AAC object type is not supported",
+                ));
+            }
+            let mut inner_pos = pos + 13;
+            while inner_pos < inner_end {
+                let (deep_tag, deep_len) = read_esds_descriptor(bytes, &mut inner_pos, inner_end)?;
+                let deep_end = inner_pos + deep_len;
+                if deep_end > inner_end {
+                    return Err(Error::Truncated {
+                        needed: deep_end,
+                        had: bytes.len(),
+                    });
+                }
+                if deep_tag == 0x05 {
+                    return Ok(bytes[inner_pos..deep_end].to_vec());
+                }
+                inner_pos = deep_end;
+            }
+            return Err(Error::InvalidData {
+                offset: esds.offset,
+                detail: "esds DecoderConfigDescriptor has no DecoderSpecificInfo",
+            });
+        }
+        pos = inner_end;
+    }
+    Err(Error::InvalidData {
+        offset: esds.offset,
+        detail: "esds box has no DecoderConfigDescriptor",
+    })
 }
 
 /// Parses `stts` into (sample count, delta) runs.

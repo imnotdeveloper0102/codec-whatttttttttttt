@@ -1385,14 +1385,21 @@ fn fixed_residual(samples: &[i64], order: usize) -> Vec<i64> {
 }
 
 /// Autocorrelation `r[k] = sum x[n] * x[n-k]` for `k = 0..=order`
-/// (f64: i16 inputs convert exactly, and the sums stay far below
-/// the 53-bit mantissa for a 4096-sample frame).
-fn autocorrelation(samples: &[i16], order: usize) -> Vec<f64> {
+/// (f64: 16-bit inputs convert exactly and the sums stay far below
+/// the 53-bit mantissa for a 4096-sample frame; for 20/24-bit
+/// inputs the sums are approximate, which only affects predictor
+/// selection — the residual is computed exactly from the quantized
+/// coefficients, so the round-trip stays exact).
+// The `i64` to `f64` conversion is approximate for large
+// magnitudes; that only affects predictor selection, and the
+// residual is computed exactly from the quantized coefficients.
+#[allow(clippy::cast_precision_loss)]
+fn autocorrelation(samples: &[i64], order: usize) -> Vec<f64> {
     let mut r = vec![0.0f64; order + 1];
     for k in 0..=order {
         let mut sum = 0.0f64;
         for n in k..samples.len() {
-            sum += f64::from(samples[n]) * f64::from(samples[n - k]);
+            sum += samples[n] as f64 * samples[n - k] as f64;
         }
         r[k] = sum;
     }
@@ -1484,10 +1491,11 @@ fn lpc_residual(samples: &[i64], coefficients: &[i64], shift: u32) -> Vec<i64> {
 
 /// A subframe choice for one channel, with everything needed to
 /// write it: the warm-up samples, the quantized predictor, and the
-/// residual with its best Rice parameter.
+/// residual with its best Rice parameter. Samples are `i64` so
+/// the same choice covers 16/20/24-bit input.
 #[derive(Debug, Clone)]
 enum SubframeChoice {
-    Constant(i16),
+    Constant(i64),
     Verbatim,
     Fixed {
         order: usize,
@@ -1505,18 +1513,21 @@ enum SubframeChoice {
 
 /// Exact bit cost of a subframe choice, including the 8-bit
 /// subframe header (padding bit, 6-bit type, wasted-bits flag).
-fn subframe_cost(choice: &SubframeChoice, block_size: usize) -> u64 {
+/// `bits_per_sample` is the sample width the subframe is written
+/// at (16, 20, or 24).
+fn subframe_cost(choice: &SubframeChoice, block_size: usize, bits_per_sample: u8) -> u64 {
     const HEADER_BITS: u64 = 8;
+    let sample_bits = u64::from(bits_per_sample);
     match choice {
-        SubframeChoice::Constant(_) => HEADER_BITS + 16,
-        SubframeChoice::Verbatim => HEADER_BITS + (block_size as u64) * 16,
+        SubframeChoice::Constant(_) => HEADER_BITS + sample_bits,
+        SubframeChoice::Verbatim => HEADER_BITS + (block_size as u64) * sample_bits,
         SubframeChoice::Fixed {
             order,
             residual,
             rice_parameter,
         } => {
             let rice_bits = rice_cost(residual, *rice_parameter);
-            HEADER_BITS + (*order as u64) * 16 + 10 + rice_bits
+            HEADER_BITS + (*order as u64) * sample_bits + 10 + rice_bits
         }
         SubframeChoice::Lpc {
             order,
@@ -1526,7 +1537,7 @@ fn subframe_cost(choice: &SubframeChoice, block_size: usize) -> u64 {
         } => {
             let rice_bits = rice_cost(residual, *rice_parameter);
             HEADER_BITS
-                + (*order as u64) * 16
+                + (*order as u64) * sample_bits
                 + 4
                 + 5
                 + (*order as u64) * u64::from(LPC_PRECISION)
@@ -1541,17 +1552,17 @@ fn subframe_cost(choice: &SubframeChoice, block_size: usize) -> u64 {
 /// orders 1–8. A predicted subframe whose best Rice cost is not
 /// better than verbatim is written verbatim. Channels are
 /// independent (no mid/side decorrelation in Phase 9).
-fn choose_subframe(samples: &[i16]) -> SubframeChoice {
+fn choose_subframe(samples: &[i64], bits_per_sample: u8) -> SubframeChoice {
     let block_size = samples.len();
     let verbatim = SubframeChoice::Verbatim;
-    let verbatim_cost = subframe_cost(&verbatim, block_size);
+    let verbatim_cost = subframe_cost(&verbatim, block_size, bits_per_sample);
     let mut best = verbatim;
     let mut best_cost = verbatim_cost;
 
     if let Some(&first) = samples.first() {
         if samples.iter().all(|&value| value == first) {
             let constant = SubframeChoice::Constant(first);
-            let cost = subframe_cost(&constant, block_size);
+            let cost = subframe_cost(&constant, block_size, bits_per_sample);
             if cost < best_cost {
                 best = constant;
                 best_cost = cost;
@@ -1559,12 +1570,11 @@ fn choose_subframe(samples: &[i16]) -> SubframeChoice {
         }
     }
 
-    let samples_i64: Vec<i64> = samples.iter().map(|&value| i64::from(value)).collect();
     for order in 0..=4usize {
         if block_size <= order {
             continue;
         }
-        let residual = fixed_residual(&samples_i64, order);
+        let residual = fixed_residual(samples, order);
         if residual
             .iter()
             .any(|&value| value <= -(1i64 << 31) || value >= (1i64 << 31))
@@ -1577,7 +1587,7 @@ fn choose_subframe(samples: &[i16]) -> SubframeChoice {
             residual,
             rice_parameter,
         };
-        let cost = subframe_cost(&choice, block_size);
+        let cost = subframe_cost(&choice, block_size, bits_per_sample);
         if cost < best_cost {
             best_cost = cost;
             best = choice;
@@ -1591,7 +1601,7 @@ fn choose_subframe(samples: &[i16]) -> SubframeChoice {
         let r = autocorrelation(samples, order);
         let coefficients = levinson_durbin(&r, order);
         let (quantized, shift) = quantize_lpc(&coefficients[1..]);
-        let residual = lpc_residual(&samples_i64, &quantized, shift);
+        let residual = lpc_residual(samples, &quantized, shift);
         if residual
             .iter()
             .any(|&value| value <= -(1i64 << 31) || value >= (1i64 << 31))
@@ -1606,7 +1616,7 @@ fn choose_subframe(samples: &[i16]) -> SubframeChoice {
             residual,
             rice_parameter,
         };
-        let cost = subframe_cost(&choice, block_size);
+        let cost = subframe_cost(&choice, block_size, bits_per_sample);
         if cost < best_cost {
             best_cost = cost;
             best = choice;
@@ -1619,19 +1629,26 @@ fn choose_subframe(samples: &[i16]) -> SubframeChoice {
 /// Writes one channel's subframe (RFC 9639 section 9.2): the
 /// padding bit (0), the 6-bit type, the wasted-bits flag (0), then
 /// the type-specific data and the single-partition Rice residual.
-fn write_subframe(writer: &mut BitWriter, samples: &[i16], choice: &SubframeChoice) -> Result<()> {
+/// Samples are written at `bits_per_sample` bits.
+fn write_subframe(
+    writer: &mut BitWriter,
+    samples: &[i64],
+    choice: &SubframeChoice,
+    bits_per_sample: u8,
+) -> Result<()> {
+    let sample_bits = u32::from(bits_per_sample);
     writer.write_bits(0, 1)?;
     match choice {
         SubframeChoice::Constant(value) => {
             writer.write_bits(0, 6)?;
             writer.write_bits(0, 1)?;
-            writer.write_signed(i64::from(*value), 16)?;
+            writer.write_signed(*value, sample_bits)?;
         }
         SubframeChoice::Verbatim => {
             writer.write_bits(1, 6)?;
             writer.write_bits(0, 1)?;
             for &sample in samples {
-                writer.write_signed(i64::from(sample), 16)?;
+                writer.write_signed(sample, sample_bits)?;
             }
         }
         SubframeChoice::Fixed {
@@ -1642,7 +1659,7 @@ fn write_subframe(writer: &mut BitWriter, samples: &[i16], choice: &SubframeChoi
             writer.write_bits(8 + u32::try_from(*order).unwrap_or(0), 6)?;
             writer.write_bits(0, 1)?;
             for &sample in &samples[..*order] {
-                writer.write_signed(i64::from(sample), 16)?;
+                writer.write_signed(sample, sample_bits)?;
             }
             write_residual(writer, residual, *rice_parameter)?;
         }
@@ -1656,7 +1673,7 @@ fn write_subframe(writer: &mut BitWriter, samples: &[i16], choice: &SubframeChoi
             writer.write_bits(31 + u32::try_from(*order).unwrap_or(0), 6)?;
             writer.write_bits(0, 1)?;
             for &sample in &samples[..*order] {
-                writer.write_signed(i64::from(sample), 16)?;
+                writer.write_signed(sample, sample_bits)?;
             }
             writer.write_bits(LPC_PRECISION - 1, 4)?;
             writer.write_signed(i64::from(*shift), 5)?;
@@ -1742,26 +1759,43 @@ fn sample_rate_code(sample_rate: u32, out: &mut Vec<u8>) -> u8 {
     }
 }
 
-/// Encodes one FLAC frame (RFC 9639 section 9): a frame header
-/// with CRC-8, one subframe per channel, and a CRC-16 footer.
-/// `samples` are interleaved i16, `block_size` =
-/// `samples.len() / channels` interchannel samples (1..=4096).
-/// `sample_number` is the sample number of the first sample in
-/// this frame (variable blocking strategy).
+/// Frame header bits-per-sample code (RFC 9639 section 9.1.1):
+/// 16-bit is code 4, 20-bit code 5, 24-bit code 6. Other widths
+/// are rejected by the wide encoder; 32-bit is out of scope for
+/// this round (the decoder already accepts it).
+fn bps_code(bits_per_sample: u8) -> Result<u8> {
+    match bits_per_sample {
+        16 => Ok(4),
+        20 => Ok(5),
+        24 => Ok(6),
+        _ => Err(Error::InvalidArgument(
+            "flac bits per sample must be 16, 20, or 24",
+        )),
+    }
+}
+
+/// Encodes one FLAC frame from interleaved i32 samples at
+/// 16, 20, or 24 bits per sample (RFC 9639 section 9.1).
+/// `sample_number` is the number of the first sample in the
+/// frame. Decoding the result with the Phase 2 decoder returns
+/// the original samples exactly.
 ///
 /// # Errors
 ///
 /// Returns `InvalidArgument` for a channel count outside 1..=8,
-/// a zero or over-limit sample rate, a sample count that is not a
-/// whole number of frames, or a block size outside 1..=4096, and
-/// `Overflow` for a sample number the coded-number form cannot
-/// represent.
-pub fn encode_flac_frame(
-    samples: &[i16],
+/// a zero or over-limit sample rate, a bit depth outside 16/20/24,
+/// a sample outside the bit depth's range, an empty input, a
+/// sample count that is not a whole number of frames, or a block
+/// size above 4096, and `Overflow` for a sample number the
+/// coded-number form cannot represent.
+pub fn encode_flac_frame_wide(
+    samples: &[i32],
     channels: u32,
     sample_rate: u32,
     sample_number: u64,
+    bits_per_sample: u8,
 ) -> Result<Vec<u8>> {
+    let code = bps_code(bits_per_sample)?;
     if channels == 0 || channels > MAX_CHANNELS {
         return Err(Error::InvalidArgument(
             "flac channel count must be between 1 and 8",
@@ -1782,10 +1816,22 @@ pub fn encode_flac_frame(
             "flac block size exceeds 4096 samples",
         ));
     }
+    // Samples must fit the declared width; a wider value would be
+    // silently truncated by `write_signed`.
+    let minimum = -(1i64 << (u32::from(bits_per_sample) - 1));
+    let maximum = (1i64 << (u32::from(bits_per_sample) - 1)) - 1;
+    if samples
+        .iter()
+        .any(|&sample| i64::from(sample) < minimum || i64::from(sample) > maximum)
+    {
+        return Err(Error::InvalidArgument(
+            "flac sample out of range for the bit depth",
+        ));
+    }
     // Deinterleave into per-channel samples.
-    let mut per_channel: Vec<Vec<i16>> = vec![Vec::with_capacity(block_size); channels];
+    let mut per_channel: Vec<Vec<i64>> = vec![Vec::with_capacity(block_size); channels];
     for (index, &sample) in samples.iter().enumerate() {
-        per_channel[index % channels].push(sample);
+        per_channel[index % channels].push(i64::from(sample));
     }
 
     let mut header: Vec<u8> = Vec::with_capacity(16);
@@ -1795,21 +1841,46 @@ pub fn encode_flac_frame(
     let block_code = block_size_code(u32::try_from(block_size).unwrap_or(0), &mut trailing);
     let rate_code = sample_rate_code(sample_rate, &mut trailing);
     header.push((block_code << 4) | rate_code);
-    header.push((u8::try_from(channels - 1).unwrap_or(0) << 4) | (4 << 1));
+    header.push((u8::try_from(channels - 1).unwrap_or(0) << 4) | (code << 1));
     write_coded_number(sample_number, &mut header)?;
     header.extend_from_slice(&trailing);
     header.push(crc8(&header));
 
     let mut writer = BitWriter::new();
     for channel_samples in &per_channel {
-        let choice = choose_subframe(channel_samples);
-        write_subframe(&mut writer, channel_samples, &choice)?;
+        let choice = choose_subframe(channel_samples, bits_per_sample);
+        write_subframe(&mut writer, channel_samples, &choice, bits_per_sample)?;
     }
     let mut frame = header;
     frame.extend_from_slice(&writer.finish());
     let crc = crc16(&frame);
     frame.extend_from_slice(&crc.to_be_bytes());
     Ok(frame)
+}
+
+/// Encodes one FLAC frame (RFC 9639 section 9): a frame header
+/// with CRC-8, one subframe per channel, and a CRC-16 footer.
+/// `samples` are interleaved i16, `block_size` =
+/// `samples.len() / channels` interchannel samples (1..=4096).
+/// `sample_number` is the sample number of the first sample in
+/// this frame (variable blocking strategy). This is the 16-bit
+/// entry point; use `encode_flac_frame_wide` for 20/24-bit.
+///
+/// # Errors
+///
+/// Returns `InvalidArgument` for a channel count outside 1..=8,
+/// a zero or over-limit sample rate, a sample count that is not a
+/// whole number of frames, or a block size outside 1..=4096, and
+/// `Overflow` for a sample number the coded-number form cannot
+/// represent.
+pub fn encode_flac_frame(
+    samples: &[i16],
+    channels: u32,
+    sample_rate: u32,
+    sample_number: u64,
+) -> Result<Vec<u8>> {
+    let samples: Vec<i32> = samples.iter().map(|&sample| i32::from(sample)).collect();
+    encode_flac_frame_wide(&samples, channels, sample_rate, sample_number, 16)
 }
 
 /// Streaming FLAC encoder: one frame per `encode` call. The
@@ -1820,6 +1891,7 @@ pub struct FlacEncoder {
     channels: u32,
     sample_rate: u32,
     sample_number: u64,
+    bits_per_sample: u8,
 }
 
 impl FlacEncoder {
@@ -1830,6 +1902,23 @@ impl FlacEncoder {
     /// Returns `InvalidArgument` for a channel count outside 1..=8
     /// or a zero or over-limit sample rate.
     pub fn new(channels: u32, sample_rate: u32) -> Result<Self> {
+        Self::with_bits_per_sample(channels, sample_rate, 16)
+    }
+
+    /// Creates a streaming encoder at 16, 20, or 24 bits per
+    /// sample; `encode_i32` encodes at that width.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidArgument` for a channel count outside 1..=8,
+    /// a zero or over-limit sample rate, or a bit depth outside
+    /// 16/20/24.
+    pub fn with_bits_per_sample(
+        channels: u32,
+        sample_rate: u32,
+        bits_per_sample: u8,
+    ) -> Result<Self> {
+        bps_code(bits_per_sample)?;
         if channels == 0 || channels > MAX_CHANNELS {
             return Err(Error::InvalidArgument(
                 "flac channel count must be between 1 and 8",
@@ -1842,6 +1931,7 @@ impl FlacEncoder {
             channels,
             sample_rate,
             sample_number: 0,
+            bits_per_sample,
         })
     }
 
@@ -1857,7 +1947,7 @@ impl FlacEncoder {
             max_frame_size: 0,
             sample_rate: self.sample_rate,
             channels: self.channels,
-            bits_per_sample: 16,
+            bits_per_sample: u32::from(self.bits_per_sample),
             total_samples: 0,
             md5: [0; 16],
         })
@@ -1878,6 +1968,27 @@ impl FlacEncoder {
         Ok(frame)
     }
 
+    /// Encodes one frame from interleaved i32 samples at the bit
+    /// depth this encoder was created with. The block size is
+    /// `samples.len() / channels` (1..=4096).
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidArgument` for an empty input, a sample
+    /// outside the bit depth's range, a sample count that is not
+    /// a whole number of frames, or a block size above 4096.
+    pub fn encode_i32(&mut self, samples: &[i32]) -> Result<Vec<u8>> {
+        let frame = encode_flac_frame_wide(
+            samples,
+            self.channels,
+            self.sample_rate,
+            self.sample_number,
+            self.bits_per_sample,
+        )?;
+        self.sample_number += (samples.len() / self.channels as usize) as u64;
+        Ok(frame)
+    }
+
     /// Sample number of the next frame's first sample.
     #[must_use]
     pub fn sample_number(&self) -> u64 {
@@ -1885,18 +1996,26 @@ impl FlacEncoder {
     }
 }
 
-/// Encodes interleaved i16 samples as a complete FLAC file:
-/// `fLaC` marker, STREAMINFO (exact min/max block size and total
-/// samples, MD5 unset), then 4096-sample frames with the last
-/// frame holding the remainder. Decoding the result with the
-/// Phase 2 decoder returns the original samples byte-identically.
+/// Encodes interleaved i32 samples as a complete FLAC file at
+/// 16, 20, or 24 bits per sample: `fLaC` marker, STREAMINFO
+/// (exact min/max block size and total samples, MD5 unset), then
+/// 4096-sample frames with the last frame holding the remainder.
+/// Decoding the result with the Phase 2 decoder returns the
+/// original samples exactly.
 ///
 /// # Errors
 ///
 /// Returns `InvalidArgument` for an empty input, a channel count
-/// outside 1..=8, a zero or over-limit sample rate, or a sample
-/// count that is not a whole number of frames.
-pub fn encode_flac_stream(samples: &[i16], channels: u32, sample_rate: u32) -> Result<Vec<u8>> {
+/// outside 1..=8, a zero or over-limit sample rate, a bit depth
+/// outside 16/20/24, a sample outside the bit depth's range, or
+/// a sample count that is not a whole number of frames.
+pub fn encode_flac_stream_wide(
+    samples: &[i32],
+    channels: u32,
+    sample_rate: u32,
+    bits_per_sample: u8,
+) -> Result<Vec<u8>> {
+    bps_code(bits_per_sample)?;
     if samples.is_empty() {
         return Err(Error::InvalidArgument("flac encode requires samples"));
     }
@@ -1921,11 +2040,12 @@ pub fn encode_flac_stream(samples: &[i16], channels: u32, sample_rate: u32) -> R
         let block_size = u16::try_from(block_size).unwrap_or(0);
         min_block_size = min_block_size.min(block_size);
         max_block_size = max_block_size.max(block_size);
-        frames.push(encode_flac_frame(
+        frames.push(encode_flac_frame_wide(
             chunk,
             channels,
             sample_rate,
             sample_number,
+            bits_per_sample,
         )?);
         sample_number += u64::from(block_size);
     }
@@ -1938,7 +2058,7 @@ pub fn encode_flac_stream(samples: &[i16], channels: u32, sample_rate: u32) -> R
         max_frame_size,
         sample_rate,
         channels,
-        bits_per_sample: 16,
+        bits_per_sample: u32::from(bits_per_sample),
         total_samples,
         md5: [0; 16],
     });
@@ -1948,6 +2068,21 @@ pub fn encode_flac_stream(samples: &[i16], channels: u32, sample_rate: u32) -> R
     Ok(out)
 }
 
+/// Encodes interleaved i16 samples as a complete FLAC file:
+/// `fLaC` marker, STREAMINFO (exact min/max block size and total
+/// samples, MD5 unset), then 4096-sample frames with the last
+/// frame holding the remainder. Decoding the result with the
+/// Phase 2 decoder returns the original samples byte-identically.
+///
+/// # Errors
+///
+/// Returns `InvalidArgument` for an empty input, a channel count
+/// outside 1..=8, a zero or over-limit sample rate, or a sample
+/// count that is not a whole number of frames.
+pub fn encode_flac_stream(samples: &[i16], channels: u32, sample_rate: u32) -> Result<Vec<u8>> {
+    let samples: Vec<i32> = samples.iter().map(|&sample| i32::from(sample)).collect();
+    encode_flac_stream_wide(&samples, channels, sample_rate, 16)
+}
 #[cfg(test)]
 mod tests {
     use super::*;

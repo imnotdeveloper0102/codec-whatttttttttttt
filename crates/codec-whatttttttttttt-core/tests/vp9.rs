@@ -18,7 +18,7 @@
 //! sizes are little-endian.
 
 use codec_whatttttttttttt_core::{
-    parse_superframe, parse_vp9_frame, Codec, Decoder, Demuxer, Error, Packet,
+    parse_superframe, parse_vp9_frame, Codec, Decoder, Demuxer, Error, Frame, Packet,
     Vp9InterpolationFilter, Vp9ReferenceMode, Vp9ReferenceState,
 };
 
@@ -369,12 +369,13 @@ fn corrupt_vp9_input_does_not_panic() {
 }
 
 #[test]
-fn decoder_probes_ivf_and_reports_vp9_unsupported_for_decode() {
+fn decoder_decodes_vp9_keyframe_bit_exact() {
     let frames = ivf_frames("vp9_64x64.ivf");
     let bytes = std::fs::read("tests/data/vp9_64x64.ivf").unwrap();
     assert_eq!(Decoder::probe(&bytes).unwrap(), Codec::Vp9);
     let mut state = Vp9ReferenceState::default();
     let frame = parse_vp9_frame(&frames[0].1, &mut state).unwrap();
+    assert!(frame.header.is_keyframe);
     let mut decoder = Decoder::from_vp9_frame_header(&frame.header).expect("vp9 decoder");
     let packet = Packet {
         codec: Codec::Vp9,
@@ -382,6 +383,53 @@ fn decoder_probes_ivf_and_reports_vp9_unsupported_for_decode() {
         timestamp: 0,
         is_keyframe: true,
     };
-    let err = decoder.decode(&packet).unwrap_err();
+    let output = decoder.decode(&packet).unwrap();
+    let video = match output {
+        Frame::Video(video) => video,
+        Frame::Audio(_) => panic!("expected a video frame"),
+    };
+    assert_eq!(video.width, 64);
+    assert_eq!(video.height, 64);
+    // 64x64 yuv420p: Y 4096 + U 1024 + V 1024 bytes; the
+    // reference holds all 10 frames, frame 0 is first.
+    let reference = std::fs::read("tests/data/vp9_64x64_ref.yuv").unwrap();
+    assert!(reference.len() >= 64 * 64 * 3 / 2);
+    let widths = [64usize, 32, 32];
+    let rows = [64usize, 32, 32];
+    let mut decoded_bytes = Vec::with_capacity(64 * 64 * 3 / 2);
+    for (index, plane) in video.planes.iter().enumerate() {
+        let stride = video.strides[index];
+        for row in 0..rows[index] {
+            decoded_bytes.extend_from_slice(&plane[row * stride..row * stride + widths[index]]);
+        }
+    }
+    assert_eq!(decoded_bytes, reference[..64 * 64 * 3 / 2]);
+}
+
+#[test]
+fn decoder_reports_vp9_inter_frame_as_unsupported() {
+    let frames = ivf_frames("vp9rec_320x240.ivf");
+    assert!(frames.len() >= 2);
+    let mut state = Vp9ReferenceState::default();
+    let first = parse_vp9_frame(&frames[0].1, &mut state).unwrap();
+    assert!(first.header.is_keyframe);
+    let mut decoder = Decoder::from_vp9_frame_header(&first.header).expect("vp9 decoder");
+    let key_packet = Packet {
+        codec: Codec::Vp9,
+        data: frames[0].1.clone(),
+        timestamp: 0,
+        is_keyframe: true,
+    };
+    decoder.decode(&key_packet).unwrap();
+    // Frame 1 is an inter frame; motion compensation is not
+    // pixel-correct yet, so the decoder refuses it instead of
+    // returning wrong pixels.
+    let inter_packet = Packet {
+        codec: Codec::Vp9,
+        data: frames[1].1.clone(),
+        timestamp: 0,
+        is_keyframe: false,
+    };
+    let err = decoder.decode(&inter_packet).unwrap_err();
     assert!(matches!(err, Error::Unsupported(_)));
 }

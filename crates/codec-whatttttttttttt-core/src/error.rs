@@ -39,6 +39,12 @@ pub enum Error {
     /// a positive value is required, or inconsistent with other arguments).
     #[error("invalid argument: {0}")]
     InvalidArgument(&'static str),
+
+    /// A licensed codec was requested without a valid license. The
+    /// codec is named so the caller can tell which license is
+    /// missing; no software fallback exists for these codecs.
+    #[error("license required for codec {codec}")]
+    LicenseRequired { codec: &'static str },
 }
 
 /// Convenience alias used by every public function in this crate.

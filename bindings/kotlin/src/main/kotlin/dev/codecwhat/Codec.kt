@@ -15,6 +15,7 @@ const val ERR_UNSUPPORTED = 4
 const val ERR_OVERFLOW = 5
 const val ERR_ALLOCATION_LIMIT = 6
 const val ERR_INVALID_ARGUMENT = 7
+const val ERR_LICENSE_REQUIRED = 8
 
 // Codec ids (must match codec_whatttttttttttt.h).
 const val CODEC_UNKNOWN = -1

@@ -11,6 +11,15 @@ repository = "https://example.invalid/codec-whatttttttttttt"
 [dependencies]
 thiserror.workspace = true
 
+# License gates for patent-encumbered codecs. All off by default:
+# building with them only compiles the hardware path behind the
+# gate; it never enables a software encoder or decoder for these
+# codecs, and a valid `LicenseContext` is still required at runtime.
+[features]
+default = []
+licensed-avc-hevc = []
+licensed-aac = []
+
 [dev-dependencies]
 proptest.workspace = true
 

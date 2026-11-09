@@ -40,12 +40,12 @@
 //! implementation is a direct O(N^2) sum; an FFT-based MDCT is a later
 //! optimisation, not a correctness requirement for this phase.
 //!
-//! CELT (RFC 6716 section 4.3.7) uses the same cosine matrix with a
-//! different scaling convention: its inverse MDCT scales by `1/2`,
-//! with the complementary scale carried by its forward MDCT. When
-//! CELT sample decode lands, its spectrum must be pre-scaled by `1/2`
-//! before calling `mdct_inverse` (which applies no scale itself);
-//! do not change the scale here, which is the Vorbis convention.
+//! CELT (RFC 6716 section 4.3.7) uses the same cosine matrix:
+//! its inverse MDCT (`clt_mdct_backward`) equals the direct cosine
+//! sum at scale 1.0, the same scale `mdct_inverse` computes, so no
+//! pre-scale is applied or needed on the CELT path (verified against
+//! the reference build in `celt_reconstruct.rs`); do not change the
+//! scale here, which is the Vorbis convention.
 
 use crate::error::{Error, Result};
 

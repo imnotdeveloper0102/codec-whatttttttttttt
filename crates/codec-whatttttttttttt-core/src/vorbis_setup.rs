@@ -550,10 +550,9 @@ fn render_line(x0: i64, y0: i64, x1: i64, y1: i64, v: &mut [i32]) {
 }
 
 /// Floor type 0 configuration (Vorbis I spec section 6.2.1).
-/// Only the header is parsed: packet decode is not implemented
-/// (curve computation needs the Bark-scale LSP filter, whose
-/// formula images are not recoverable from the specification text,
-/// and no encoder since libvorbis beta 4 emits floor 0).
+/// Packet decode is implemented (sections 6.2.2 and 6.2.3); no
+/// encoder since libvorbis beta 4 emits floor 0, so real floor 0
+/// streams are rare, but the format is not deprecated.
 #[derive(Debug, Clone)]
 pub struct Floor0 {
     /// LSP order.
@@ -568,6 +567,203 @@ pub struct Floor0 {
     pub amplitude_offset: u8,
     /// Codebook indices used for the LSP coefficients.
     pub book_list: Vec<u8>,
+}
+
+/// Bark scale (Vorbis I spec section 6.2.3, post-errata 20150227):
+/// `13.1*atan(0.00074*x) + 2.24*atan(0.0000000185*x^2) + 0.0001*x`.
+/// The errata corrects a misplaced parenthesis in the earlier
+/// typesetting, which had the `0.0001*x` term inside the second
+/// `atan`.
+fn bark_scale(x: f64) -> f64 {
+    13.1 * (0.00074 * x).atan() + 2.24 * (0.000_000_018_5 * x * x).atan() + 0.0001 * x
+}
+
+impl Floor0 {
+    /// Decodes one floor 0 curve of length `n` (sections 6.2.2
+    /// and 6.2.3). Returns `Ok(None)` when the floor is unused:
+    /// amplitude zero, or end-of-packet during decode, which is
+    /// nominal per section 6.2.2.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidData` when the book number is out of range,
+    /// a referenced codebook is missing, the setup has a zero rate
+    /// or Bark map size (the curve computation divides by both),
+    /// or degenerate LSP coefficients make the curve denominator
+    /// zero; `Truncated` only for read errors that are not
+    /// end-of-packet (there are none in this path: end-of-packet
+    /// maps to `Ok(None)`).
+    pub fn decode(
+        &self,
+        reader: &mut LsbBitReader<'_>,
+        codebooks: &[Codebook],
+        n: usize,
+    ) -> Result<Option<Vec<f32>>> {
+        match self.decode_inner(reader, codebooks, n) {
+            Ok(result) => Ok(result),
+            Err(Error::Truncated { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn decode_inner(
+        &self,
+        reader: &mut LsbBitReader<'_>,
+        codebooks: &[Codebook],
+        n: usize,
+    ) -> Result<Option<Vec<f32>>> {
+        if self.rate == 0 || self.bark_map_size == 0 {
+            return Err(Error::InvalidData {
+                offset: reader.bit_position() / 8,
+                detail: "floor 0 rate or bark map size is zero",
+            });
+        }
+        let amplitude = reader.read_bits(u32::from(self.amplitude_bits))?;
+        if amplitude == 0 {
+            return Ok(None);
+        }
+        let book_count = self.book_list.len();
+        let booknumber = reader.read_bits(ilog(u32::try_from(book_count).unwrap_or(0)))? as usize;
+        if booknumber >= book_count {
+            return Err(Error::InvalidData {
+                offset: reader.bit_position() / 8,
+                detail: "floor 0 book number exceeds book list",
+            });
+        }
+        let book = codebooks
+            .get(usize::from(self.book_list[booknumber]))
+            .ok_or(Error::InvalidData {
+                offset: reader.bit_position() / 8,
+                detail: "floor 0 book exceeds codebook count",
+            })?;
+        // Section 6.2.2 steps 6-11: read VQ vectors from the one
+        // selected book until at least `order` scalars are held,
+        // adding the running `last` scalar to each vector before
+        // concatenation and then setting `last` to the vector's
+        // last scalar. `last` carries across vectors: the loop
+        // returns to the vector-read step, not to the
+        // initialization (resetting it each time would make the
+        // accumulation a no-op); libvorbis `floor0_inverse1`
+        // accumulates the same way. Over-reading past `order`
+        // is allowed; the extra scalars are discarded.
+        let mut coefficients: Vec<f32> = Vec::new();
+        let mut last: f32 = 0.0;
+        while coefficients.len() < usize::from(self.order) {
+            let mut temp = vec![0.0f32; usize::from(book.dimensions)];
+            book.decode_vector(reader, &mut temp)?;
+            for value in &mut temp {
+                *value += last;
+            }
+            if let Some(&last_value) = temp.last() {
+                last = last_value;
+            }
+            coefficients.extend_from_slice(&temp);
+        }
+        coefficients.truncate(usize::from(self.order));
+        Ok(Some(self.curve(amplitude, &coefficients, n)?))
+    }
+
+    /// Curve computation (section 6.2.3): the Bark-scale map,
+    /// then the LSP filter response `p`/`q` at each mapped
+    /// angle, converted from the log (dB) scale to linear
+    /// amplitude. Consecutive output bins with the same map
+    /// value share one computed value (step 8's
+    /// `iteration_condition` chaining).
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidData` when degenerate LSP coefficients
+    /// make the curve value non-finite (see the note below).
+    // The two casts are bounded: the map value is floored and
+    // clamped to `[0, bark_map_size - 1]` (at most 65535) before
+    // the `f64` to integer conversion, and the curve value is
+    // checked finite before the `f64` to `f32` conversion, whose
+    // rounding is the output format's own precision.
+    #[allow(clippy::cast_possible_truncation)]
+    fn curve(&self, amplitude: u32, coefficients: &[f32], n: usize) -> Result<Vec<f32>> {
+        let order = usize::from(self.order);
+        let bark_map_size = f64::from(self.bark_map_size);
+        let bark_max = bark_scale(f64::from(self.rate) * 0.5);
+        // `map[i]` for `i` in 0..n; the map is non-decreasing
+        // because the Bark scale is increasing in frequency.
+        // `bark_max` is positive (rate > 0, checked in
+        // `decode_inner`), so the division is defined. Map
+        // values fit in `u32`: they are clamped to
+        // `bark_map_size - 1` (a `u16`).
+        let n_u32 = u32::try_from(n).unwrap_or(0);
+        let map: Vec<u32> = (0..n)
+            .map(|i| {
+                let i_u32 = u32::try_from(i).unwrap_or(0);
+                let frequency = f64::from(self.rate) * f64::from(i_u32) / (2.0 * f64::from(n_u32));
+                let value = (bark_scale(frequency) * bark_map_size / bark_max).floor() as i64;
+                u32::try_from(value.clamp(0, i64::from(self.bark_map_size) - 1)).unwrap_or(0)
+            })
+            .collect();
+        // `cos` of each LSP coefficient (an angle in radians).
+        let cos_coefficients: Vec<f64> = coefficients
+            .iter()
+            .map(|&value| f64::from(value).cos())
+            .collect();
+        // `(2^amplitude_bits - 1)` as an `f64`. `amplitude_bits`
+        // is at most 32 here (`decode_inner` reads the amplitude
+        // with `read_bits`, which rejects wider reads) and at
+        // least 1 (a zero amplitude returns early), so the power
+        // is exact.
+        let maxval = 2f64.powi(i32::from(self.amplitude_bits)) - 1.0;
+        let amplitude_offset = f64::from(self.amplitude_offset);
+        let mut output = vec![0.0f32; n];
+        let mut i = 0usize;
+        while i < n {
+            let omega = std::f64::consts::PI * f64::from(map[i]) / bark_map_size;
+            let cos_omega = omega.cos();
+            let (p, q) = if order % 2 == 1 {
+                let mut p = 1.0 - cos_omega * cos_omega;
+                for j in 0..(order - 1) / 2 {
+                    let difference = cos_coefficients[2 * j + 1] - cos_omega;
+                    p *= 4.0 * difference * difference;
+                }
+                let mut q = 0.25;
+                for j in 0..order.div_ceil(2) {
+                    let difference = cos_coefficients[2 * j] - cos_omega;
+                    q *= 4.0 * difference * difference;
+                }
+                (p, q)
+            } else {
+                let mut p = (1.0 - cos_omega) / 2.0;
+                let mut q = (1.0 + cos_omega) / 2.0;
+                for j in 0..order / 2 {
+                    let difference = cos_coefficients[2 * j + 1] - cos_omega;
+                    p *= 4.0 * difference * difference;
+                    let difference = cos_coefficients[2 * j] - cos_omega;
+                    q *= 4.0 * difference * difference;
+                }
+                (p, q)
+            };
+            // A zero denominator needs every factor of both `p`
+            // and `q` to vanish at once, which valid LSP
+            // coefficients (distinct angles in (0, pi)) never do;
+            // it is degenerate or corrupt input. Reject it
+            // rather than letting a non-finite floor curve into
+            // the audio pipeline.
+            let linear = (0.115_129_25
+                * (f64::from(amplitude) * amplitude_offset / (maxval * (p + q).sqrt())
+                    - amplitude_offset))
+                .exp();
+            if !linear.is_finite() {
+                return Err(Error::InvalidData {
+                    offset: 0,
+                    detail: "floor 0 curve value is not finite",
+                });
+            }
+            let value = linear as f32;
+            let condition = map[i];
+            while i < n && map[i] == condition {
+                output[i] = value;
+                i += 1;
+            }
+        }
+        Ok(output)
+    }
 }
 
 /// Floor type 1 configuration (Vorbis I spec section 7.2.2).
@@ -752,10 +948,10 @@ impl Floor1 {
     }
 }
 
-/// A floor configuration: type 0 (header only) or type 1.
+/// A floor configuration: type 0 (section 6) or type 1.
 #[derive(Debug, Clone)]
 pub enum Floor {
-    /// Floor type 0 (section 6). Packet decode is unsupported.
+    /// Floor type 0 (section 6): Bark-scale LSP curve.
     Type0(Floor0),
     /// Floor type 1 (section 7).
     Type1(Floor1),
@@ -1980,5 +2176,186 @@ mod tests {
         assert_eq!(residue.cascade, vec![1, 0]);
         assert_eq!(residue.books[0][0], Some(1));
         assert_eq!(residue.books[1], [None; 8]);
+    }
+
+    /// Builds a lookup-type-2 codebook with dimensions 2 and two
+    /// entries: entry 0 is [1.0, 1.0], entry 1 is [2.0, 2.0]
+    /// (minimum 0.0, delta 1.0, multiplicands [1, 1, 2, 2]).
+    /// Codeword lengths are [1, 1], so entry 0 is the code `0`
+    /// and entry 1 is the code `1`.
+    fn floor0_book() -> Codebook {
+        let mut writer = LsbWriter::new();
+        writer.write_bytes(&[0x42, 0x43, 0x56]);
+        writer.write_bits(2, 16);
+        writer.write_bits(2, 24);
+        writer.write_bits(0, 1); // unordered
+        writer.write_bits(0, 1); // not sparse
+        writer.write_bits(0, 5); // length 1
+        writer.write_bits(0, 5); // length 1
+        writer.write_bits(2, 4); // lookup type 2
+        writer.write_bits(0, 32); // minimum 0.0
+        writer.write_bits(0x6010_0000, 32); // delta 1.0
+        writer.write_bits(2, 4); // value_bits 3
+        writer.write_bits(0, 1); // sequence_p 0
+        for &multiplicand in &[1u32, 1, 2, 2] {
+            writer.write_bits(multiplicand, 3);
+        }
+        let bytes = writer.finish();
+        let mut reader = LsbBitReader::new(&bytes);
+        parse_codebook(&mut reader).unwrap()
+    }
+
+    fn floor0_test_setup(order: u8) -> Floor0 {
+        Floor0 {
+            order,
+            rate: 8000,
+            bark_map_size: 64,
+            amplitude_bits: 8,
+            amplitude_offset: 10,
+            book_list: vec![0],
+        }
+    }
+
+    #[test]
+    fn floor0_decode_even_order_matches_hand_computed_curve() {
+        // Order 2, amplitude 255, one VQ vector (entry 0):
+        // coefficients [1.0, 1.0]. Expected curve for n = 8 was
+        // computed independently from spec section 6.2.3 (see the
+        // subagent report for the reference calculation); bin 0
+        // is the fully hand-checked value: map[0] = 0, so
+        // omega = 0, p = 0, q = 4*(cos(1)-1)^2, and the value is
+        // exp(0.11512925*(10/sqrt(q) - 10)) = 1.106205.
+        let book = floor0_book();
+        let floor0 = floor0_test_setup(2);
+        let mut packet = LsbWriter::new();
+        packet.write_bits(255, 8); // amplitude
+        packet.write_codeword(0, 1); // VQ entry 0
+        let packet = packet.finish();
+        let mut reader = LsbBitReader::new(&packet);
+        let curve = floor0.decode(&mut reader, &[book], 8).unwrap().unwrap();
+        let expected = [
+            1.106_205f32,
+            25.390_16,
+            1.020_756,
+            0.573_195_2,
+            0.501_666_9,
+            0.477_334_6,
+            0.466_346_2,
+            0.460_738_4,
+        ];
+        assert_eq!(curve.len(), 8);
+        for (index, (&got, &want)) in curve.iter().zip(expected.iter()).enumerate() {
+            assert!((got - want).abs() < 1e-5, "bin {index}: {got} != {want}");
+        }
+    }
+
+    #[test]
+    fn floor0_decode_odd_order_accumulates_last_across_vectors() {
+        // Order 3 needs two VQ vectors (dimensions 2): the first
+        // gives [1.0, 1.0] with last 0, the second gives [1.0,
+        // 1.0] plus the running last 1.0, so [2.0, 2.0]; the
+        // coefficients are [1.0, 1.0, 2.0] after truncation. If
+        // `last` were reset per vector the coefficients would be
+        // [1.0, 1.0, 1.0] and bin 0 would read 4.819799
+        // instead of 0.7656405 (both computed independently
+        // from spec section 6.2.3).
+        let book = floor0_book();
+        let floor0 = floor0_test_setup(3);
+        let mut packet = LsbWriter::new();
+        packet.write_bits(255, 8); // amplitude
+        packet.write_codeword(0, 1); // VQ entry 0
+        packet.write_codeword(0, 1); // VQ entry 0 again
+        let packet = packet.finish();
+        let mut reader = LsbBitReader::new(&packet);
+        let curve = floor0.decode(&mut reader, &[book], 8).unwrap().unwrap();
+        let expected = [
+            0.765_640_5f32,
+            8.855_375,
+            0.915_988_7,
+            0.610_539_1,
+            0.578_239_8,
+            0.580_579_9,
+            0.589_264_4,
+            0.597_49,
+        ];
+        assert_eq!(curve.len(), 8);
+        for (index, (&got, &want)) in curve.iter().zip(expected.iter()).enumerate() {
+            assert!((got - want).abs() < 1e-5, "bin {index}: {got} != {want}");
+        }
+    }
+
+    #[test]
+    fn floor0_decode_zero_amplitude_is_unused() {
+        let book = floor0_book();
+        let floor0 = floor0_test_setup(2);
+        let mut packet = LsbWriter::new();
+        packet.write_bits(0, 8); // amplitude 0
+        let packet = packet.finish();
+        let mut reader = LsbBitReader::new(&packet);
+        assert!(floor0.decode(&mut reader, &[book], 8).unwrap().is_none());
+    }
+
+    #[test]
+    fn floor0_decode_end_of_packet_is_unused() {
+        // Amplitude is present, but the packet ends before the
+        // VQ vector: nominal end-of-packet, so unused.
+        let book = floor0_book();
+        let floor0 = floor0_test_setup(2);
+        let mut packet = LsbWriter::new();
+        packet.write_bits(255, 8); // amplitude
+        let packet = packet.finish();
+        let mut reader = LsbBitReader::new(&packet);
+        assert!(floor0.decode(&mut reader, &[book], 8).unwrap().is_none());
+    }
+
+    #[test]
+    fn floor0_decode_out_of_range_book_number_is_invalid_data() {
+        // Two books in the list, but the packet selects book 2:
+        // the book number is read with ilog(2) = 2 bits.
+        let book = floor0_book();
+        let floor0 = Floor0 {
+            book_list: vec![0, 0],
+            ..floor0_test_setup(2)
+        };
+        let mut packet = LsbWriter::new();
+        packet.write_bits(255, 8); // amplitude
+        packet.write_bits(2, 2); // book number 2, out of range
+        let packet = packet.finish();
+        let mut reader = LsbBitReader::new(&packet);
+        let err = floor0.decode(&mut reader, &[book], 8).unwrap_err();
+        assert!(matches!(err, Error::InvalidData { .. }));
+    }
+
+    #[test]
+    fn floor0_decode_degenerate_coefficients_are_invalid_data() {
+        // Coefficients [0.0, 0.0] (entry 0 of a book whose values
+        // are all zero) make p + q vanish at omega = 0, so the
+        // curve value is undefined; the decode is rejected
+        // rather than returning a non-finite curve.
+        let mut writer = LsbWriter::new();
+        writer.write_bytes(&[0x42, 0x43, 0x56]);
+        writer.write_bits(2, 16);
+        writer.write_bits(1, 24);
+        writer.write_bits(0, 1); // unordered
+        writer.write_bits(0, 1); // not sparse
+        writer.write_bits(0, 5); // length 1
+        writer.write_bits(2, 4); // lookup type 2
+        writer.write_bits(0, 32); // minimum 0.0
+        writer.write_bits(0x6010_0000, 32); // delta 1.0
+        writer.write_bits(0, 4); // value_bits 1
+        writer.write_bits(0, 1); // sequence_p 0
+        writer.write_bits(0, 1); // multiplicand 0
+        writer.write_bits(0, 1); // multiplicand 0
+        let bytes = writer.finish();
+        let mut reader = LsbBitReader::new(&bytes);
+        let book = parse_codebook(&mut reader).unwrap();
+        let floor0 = floor0_test_setup(2);
+        let mut packet = LsbWriter::new();
+        packet.write_bits(255, 8); // amplitude
+        packet.write_codeword(0, 1); // the single entry
+        let packet = packet.finish();
+        let mut reader = LsbBitReader::new(&packet);
+        let err = floor0.decode(&mut reader, &[book], 8).unwrap_err();
+        assert!(matches!(err, Error::InvalidData { .. }));
     }
 }

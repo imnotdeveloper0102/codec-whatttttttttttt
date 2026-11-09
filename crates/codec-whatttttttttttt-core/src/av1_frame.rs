@@ -32,8 +32,15 @@ pub const PRIMARY_REF_NONE: u8 = 7;
 
 /// Largest tile width in pixels (AV1 spec section 3).
 pub const MAX_TILE_WIDTH: u32 = 4096;
-/// Largest tile area in superblocks (AV1 spec section 3).
-pub const MAX_TILE_AREA_SB: u32 = 4096;
+/// Largest tile area in 64x64 superblocks (AV1 spec section 3:
+/// `MAX_TILE_AREA` is 4096 * 2304 luma samples, i.e.
+/// (4096 * 2304) / (64 * 64) = 2304 superblocks of 64x64).
+/// The tile-info formula scales this down for 128x128
+/// superblocks: `MAX_TILE_AREA_SB >> (2 * (sb_size - 6))`,
+/// giving 2304 for 64x64 and 576 for 128x128 superblocks, which
+/// is exactly `MAX_TILE_AREA >> (2 * sb_size)` from spec
+/// section 5.11.
+pub const MAX_TILE_AREA_SB: u32 = 2304;
 /// Largest number of tile columns.
 pub const MAX_TILE_COLS: u32 = 64;
 /// Largest number of tile rows.
@@ -1494,7 +1501,7 @@ fn parse_tile_info(
     let sb_shift = if seq.use_128x128_superblock { 5 } else { 4 };
     let sb_size = sb_shift + 2;
     let max_tile_width_sb = MAX_TILE_WIDTH >> sb_size;
-    let max_tile_area_sb = MAX_TILE_AREA_SB >> (2 * sb_size);
+    let max_tile_area_sb = MAX_TILE_AREA_SB >> (2 * (sb_size - 6));
     let min_log2_tile_cols = tile_log2(max_tile_width_sb, sb_cols);
     let max_log2_tile_cols = tile_log2(1, sb_cols.min(MAX_TILE_COLS));
     let max_log2_tile_rows = tile_log2(1, sb_rows.min(MAX_TILE_ROWS));

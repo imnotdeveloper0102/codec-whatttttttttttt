@@ -14,6 +14,7 @@ public enum CodecError: Error, CustomStringConvertible {
     case overflow(String)
     case allocationLimit(String)
     case invalidArgument(String)
+    case licenseRequired(String)
 
     public var code: codec_error_t {
         switch self {
@@ -24,6 +25,7 @@ public enum CodecError: Error, CustomStringConvertible {
         case .overflow: return CODEC_ERR_OVERFLOW
         case .allocationLimit: return CODEC_ERR_ALLOCATION_LIMIT
         case .invalidArgument: return CODEC_ERR_INVALID_ARGUMENT
+        case .licenseRequired: return CODEC_ERR_LICENSE_REQUIRED
         }
     }
 
@@ -35,7 +37,8 @@ public enum CodecError: Error, CustomStringConvertible {
             .unsupported(let detail),
             .overflow(let detail),
             .allocationLimit(let detail),
-            .invalidArgument(let detail):
+            .invalidArgument(let detail),
+            .licenseRequired(let detail):
             return detail
         }
     }
@@ -60,6 +63,7 @@ func check(_ rc: codec_error_t) throws {
     case CODEC_ERR_UNSUPPORTED: throw CodecError.unsupported(detail)
     case CODEC_ERR_OVERFLOW: throw CodecError.overflow(detail)
     case CODEC_ERR_ALLOCATION_LIMIT: throw CodecError.allocationLimit(detail)
+    case CODEC_ERR_LICENSE_REQUIRED: throw CodecError.licenseRequired(detail)
     default: throw CodecError.invalidArgument(detail)
     }
 }

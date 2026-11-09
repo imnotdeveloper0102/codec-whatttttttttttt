@@ -316,7 +316,7 @@ fn corrupt_av1_input_does_not_panic() {
 }
 
 #[test]
-fn decoder_probes_ivf_and_reports_av1_unsupported_for_decode() {
+fn decoder_probes_ivf_and_reports_av1_cdef_gap_for_decode() {
     let frames = ivf_frames();
     let bytes = include_bytes!("data/av1_64x64.ivf");
     assert_eq!(Decoder::probe(bytes).unwrap(), Codec::Av1);
@@ -328,6 +328,13 @@ fn decoder_probes_ivf_and_reports_av1_unsupported_for_decode() {
         timestamp: 0,
         is_keyframe: true,
     };
+    // This fixture is a default libaom encode with CDEF on, so
+    // the tile walk stops at CDEF index decode before it ever
+    // reaches coefficients: no pixels exist yet, and the error
+    // names the missing piece. The coefficient gap itself is
+    // asserted at the pipeline level in `av1_reconstruct.rs`
+    // on the CDEF-off fixture.
     let err = decoder.decode(&packet).unwrap_err();
     assert!(matches!(err, Error::Unsupported(_)));
+    assert!(err.to_string().contains("cdef"));
 }

@@ -18,6 +18,13 @@
 //! returns `Unsupported` at construction. `Cues` are parsed and used
 //! for seeking; when a file has no `Cues`, seeking falls back to the
 //! video keyframe index.
+//!
+//! Passthrough (current round): `V_MPEG4/ISO/AVC`, `V_MPEGH/ISO/HEVC`,
+//! and `A_AAC` are also accepted, and their packets are returned
+//! behind the license gate (see `set_license_context`): without
+//! the feature or without a license, `next_packet` refuses the
+//! packet instead of yielding it. Packet data is the block payload
+//! as stored; nothing is decoded here.
 
 use std::io::Read;
 
@@ -29,6 +36,8 @@ use crate::ebml::{
 };
 use crate::error::{Error, Result};
 use crate::frame::{Codec, Metadata, MetadataEntry, Packet};
+use crate::hw::{licensed_feature_enabled, passthrough_allowed};
+use crate::license::LicenseContext;
 use crate::limits::{MAX_NESTING_DEPTH, MAX_TRACKS};
 
 // Element IDs (Matroska specification). Only the IDs this demuxer
@@ -110,6 +119,10 @@ pub struct MatroskaDemuxer {
     clusters: Vec<(usize, usize)>,
     segment_data_start: usize,
     segment_payload_len: usize,
+    /// License context for passthrough of AVC/HEVC/AAC packets.
+    /// `None` until the caller sets one; packets of licensed
+    /// codecs are refused until then (see `next_packet`).
+    license: Option<LicenseContext>,
 }
 
 impl MatroskaDemuxer {
@@ -203,6 +216,7 @@ impl MatroskaDemuxer {
             clusters: state.clusters,
             segment_data_start,
             segment_payload_len,
+            license: None,
         })
     }
 
@@ -242,19 +256,59 @@ impl MatroskaDemuxer {
         &self.cues
     }
 
-    /// Returns the next packet in file order, or `None` at end of
-    /// stream.
+    /// Sets the license context for passthrough of AVC/HEVC/AAC.
+    /// The license is validated eagerly for every licensed codec
+    /// the file carries, and is stored only when every check
+    /// passes; a failed check leaves the previous context (or
+    /// none) in place.
     ///
     /// # Errors
     ///
-    /// This implementation never fails after construction; the
-    /// `Result` exists so a streaming demuxer can report read
-    /// errors here.
+    /// Returns `Unsupported` when the feature for a carried
+    /// licensed codec is off, `LicenseRequired` when the license
+    /// has expired, and `InvalidArgument` for a malformed
+    /// license.
+    pub fn set_license_context(&mut self, mut license: Option<LicenseContext>) -> Result<()> {
+        if let Some(context) = license.as_mut() {
+            let mut seen: Vec<Codec> = Vec::new();
+            for track in &self.tracks {
+                if matches!(track.codec, Codec::Avc | Codec::Hevc | Codec::Aac)
+                    && !seen.contains(&track.codec)
+                {
+                    seen.push(track.codec);
+                }
+            }
+            for codec in seen {
+                if !licensed_feature_enabled(codec) {
+                    return Err(Error::Unsupported(
+                        "webm passthrough for this codec is not enabled in this build",
+                    ));
+                }
+                context.validate(codec.name())?;
+            }
+        }
+        self.license = license;
+        Ok(())
+    }
+
+    /// Returns the next packet in file order, or `None` at end of
+    /// stream. Licensed packets are gated: without a feature or
+    /// without a license this returns `Unsupported` or
+    /// `LicenseRequired` instead of the packet, and the position
+    /// does not advance, so the caller can set a license and
+    /// retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Unsupported` when the packet's codec needs a
+    /// feature that is off, and `LicenseRequired` when the codec
+    /// needs a license that was not set.
     pub fn next_packet(&mut self) -> Result<Option<Packet>> {
         if self.position >= self.packets.len() {
             return Ok(None);
         }
         let packet = self.packets[self.position].clone();
+        passthrough_allowed(packet.codec, self.license.is_some())?;
         self.position += 1;
         Ok(Some(packet))
     }
@@ -484,13 +538,19 @@ fn parse_info(
 }
 
 /// Resolves a Matroska codec ID to a library codec.
+/// `V_MPEG4/ISO/AVC`, `V_MPEGH/ISO/HEVC` and `A_AAC` are
+/// passthrough codecs (Matroska specification): their packets
+/// are returned gated by the license, never decoded.
 fn codec_for_id(codec_id: &str) -> Result<Codec> {
     match codec_id {
         "V_VP9" => Ok(Codec::Vp9),
         "V_AV1" => Ok(Codec::Av1),
+        "V_MPEG4/ISO/AVC" => Ok(Codec::Avc),
+        "V_MPEGH/ISO/HEVC" => Ok(Codec::Hevc),
         "A_OPUS" => Ok(Codec::Opus),
         "A_VORBIS" => Ok(Codec::Vorbis),
         "A_FLAC" => Ok(Codec::Flac),
+        "A_AAC" => Ok(Codec::Aac),
         "A_PCM/INT/LIT" | "A_PCM/INT/BIG" => Ok(Codec::Pcm),
         _ => Err(Error::Unsupported(
             "unsupported matroska codec id (see track codec_id)",
@@ -938,7 +998,7 @@ fn split_laces(payload: &[u8], lacing: Lacing, offset: usize) -> Result<Vec<(usi
 /// copied into the packet list.
 fn check_packet_size(codec: Codec, len: usize) -> Result<()> {
     let limit = match codec {
-        Codec::Vp9 | Codec::Av1 => crate::limits::MAX_VIDEO_PACKET_BYTES,
+        Codec::Vp9 | Codec::Av1 | Codec::Avc | Codec::Hevc => crate::limits::MAX_VIDEO_PACKET_BYTES,
         _ => crate::limits::MAX_AUDIO_PACKET_BYTES,
     };
     if len > limit {

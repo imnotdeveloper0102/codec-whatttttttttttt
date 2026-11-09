@@ -9,6 +9,7 @@ export const ERR_UNSUPPORTED = 4;
 export const ERR_OVERFLOW = 5;
 export const ERR_ALLOCATION_LIMIT = 6;
 export const ERR_INVALID_ARGUMENT = 7;
+export const ERR_LICENSE_REQUIRED = 8;
 
 export const CODEC_UNKNOWN = -1;
 export const CODEC_PCM = 0;

@@ -84,10 +84,14 @@ impl VorbisPacketDecoder {
             let submap = mapping.mux[channel] as usize;
             let floor_index = mapping.submap_floor[submap] as usize;
             match &self.setup.floors[floor_index] {
-                Floor::Type0(_) => {
-                    return Err(Error::Unsupported(
-                        "vorbis floor type 0 packet decode (Bark-scale LSP curve not implemented)",
-                    ));
+                Floor::Type0(floor0) => {
+                    if let Some(curve) = floor0.decode(reader, &self.setup.codebooks, half)? {
+                        floor_curves.push(Some(curve));
+                        *no_res = false;
+                    } else {
+                        floor_curves.push(None);
+                        *no_res = true;
+                    }
                 }
                 Floor::Type1(floor1) => {
                     if let Some(curve) = floor1.decode(reader, &self.setup.codebooks, half)? {
@@ -121,8 +125,7 @@ impl VorbisPacketDecoder {
     /// Returns `Truncated` when the packet ends before the mode or
     /// window flags are read, `InvalidData` when the packet-type
     /// bit is set, the mode index is out of range, or a window is
-    /// inconsistent, and `Unsupported` when the stream uses floor
-    /// type 0 (packet decode is not implemented for it).
+    /// inconsistent.
     pub fn decode_packet(&mut self, data: &[u8]) -> Result<Option<VorbisDecodedPacket>> {
         if data.is_empty() {
             return Err(Error::Truncated { needed: 1, had: 0 });

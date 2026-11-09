@@ -39,6 +39,7 @@ typedef int32_t codec_error_t;
 #define CODEC_ERR_OVERFLOW 5
 #define CODEC_ERR_ALLOCATION_LIMIT 6
 #define CODEC_ERR_INVALID_ARGUMENT 7
+#define CODEC_ERR_LICENSE_REQUIRED 8
 
 /* Codec identifiers, mirroring the core `Codec` enum. */
 typedef int32_t codec_codec_t;

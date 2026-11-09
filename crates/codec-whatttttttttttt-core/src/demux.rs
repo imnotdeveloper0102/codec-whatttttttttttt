@@ -11,6 +11,7 @@ use std::io::Read;
 use crate::byte_source::BoundedReader;
 use crate::error::{Error, Result};
 use crate::frame::{Codec, Metadata, Packet};
+use crate::license::LicenseContext;
 use crate::limits::MAX_MP4_FILE_BYTES;
 use crate::matroska::MatroskaDemuxer;
 use crate::mp4_box::Mp4Demuxer;
@@ -175,13 +176,36 @@ impl Demuxer {
         }
     }
 
-    /// Returns the next packet, or `None` at end of stream.
+    /// Sets the license context for passthrough of AVC/HEVC/AAC
+    /// packets. The license is validated eagerly against every
+    /// licensed codec the file carries and stored only when every
+    /// check passes; a failed check leaves the previous context
+    /// (or none) in place.
     ///
     /// # Errors
     ///
-    /// This implementation never fails after construction; the
-    /// `Result` exists so a streaming demuxer can report read
-    /// errors here.
+    /// Returns `Unsupported` when the feature for a carried
+    /// licensed codec is off, `LicenseRequired` when the license
+    /// has expired, and `InvalidArgument` for a malformed
+    /// license.
+    pub fn set_license_context(&mut self, license: Option<LicenseContext>) -> Result<()> {
+        match self {
+            Self::Webm(demuxer) => demuxer.set_license_context(license),
+            Self::Mp4(demuxer) => demuxer.set_license_context(license),
+        }
+    }
+
+    /// Returns the next packet, or `None` at end of stream.
+    /// Licensed packets are gated: without a feature or without
+    /// a license this returns `Unsupported` or `LicenseRequired`
+    /// instead of the packet, and the position does not advance,
+    /// so the caller can set a license and retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Unsupported` when the packet's codec needs a
+    /// feature that is off, and `LicenseRequired` when the codec
+    /// needs a license that was not set.
     pub fn next_packet(&mut self) -> Result<Option<Packet>> {
         match self {
             Self::Webm(demuxer) => demuxer.next_packet(),

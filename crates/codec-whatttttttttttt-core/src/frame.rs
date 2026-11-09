@@ -5,6 +5,21 @@
 //! is decoded data. No stage passes raw bytes with an implicit format.
 
 /// Codec selected by probing or by explicit construction.
+///
+/// `Avc` and `Hevc` are licensed codecs: this library never
+/// decodes or encodes them in software. `Decoder::decode` and
+/// `Encoder::encode` refuse them outright (`Unsupported` when
+/// the codec's feature is off, `LicenseRequired` when it is on
+/// but no valid license was presented); the only path is the
+/// hardware stub in `hw`, opened with a valid `LicenseContext`.
+/// `Aac` is licensed too, but unlike AVC/HEVC it has a software
+/// decoder behind the `licensed-aac` feature, opened only with a
+/// valid `LicenseContext` (see `Decoder::from_aac_config`).
+/// Demuxing and muxing containers that carry AVC/HEVC/AAC (MP4,
+/// Matroska, MPEG-TS) passes packets through behind the same
+/// gate: only the decode/encode step is closed, never the
+/// container step. M4A is MP4 carrying AAC (or ALAC), not a codec
+/// of its own. `Alac` is open and decodes in software with no gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Codec {
     /// Raw PCM samples, carried in WAV in Phase 1.
@@ -19,6 +34,21 @@ pub enum Codec {
     Av1,
     /// VP9 (decode subset from Phase 8).
     Vp9,
+    /// H.264/AVC (licensed; hardware only, never software).
+    Avc,
+    /// H.265/HEVC (licensed; hardware only, never software).
+    Hevc,
+    /// DSD 1-bit audio, carried in DSF/DFF (decode from the
+    /// current round via `Decoder::from_dsd_header`).
+    Dsd,
+    /// AAC-LC (licensed; software decode only behind the
+    /// `licensed-aac` feature with a valid `LicenseContext`).
+    Aac,
+    /// Apple Lossless (ALAC), open format, software decode.
+    Alac,
+    /// MP3 Layer III, ISO/IEC 11172-3 (decode from the current
+    /// round; Layers I and II return `Unsupported`).
+    Mp3,
 }
 
 impl Codec {
@@ -32,6 +62,12 @@ impl Codec {
             Self::Vorbis => "vorbis",
             Self::Av1 => "av1",
             Self::Vp9 => "vp9",
+            Self::Avc => "avc",
+            Self::Hevc => "hevc",
+            Self::Dsd => "dsd",
+            Self::Aac => "aac",
+            Self::Alac => "alac",
+            Self::Mp3 => "mp3",
         }
     }
 }

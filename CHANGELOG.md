@@ -6,6 +6,419 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+### Revision round (2026-11-08) — license gate, resolution, quality, dither
+
+No H.264/H.265 software code existed in this library, so there
+was no H.264/H.265 software code to remove in this round.
+What changed is the gate, the limits, and the new
+helpers; no codec implementation was added or removed.
+
+- `feat(license): license gate for patent-encumbered codecs`.
+  New `license.rs`: `LicenseContext { licensee, license_type:
+  LicenseType::{Commercial, Evaluation, Internal}, license_id,
+  expires: u64 (epoch seconds), scope }`; `new()` rejects an
+  empty licensee/scope or a malformed id (8–64 ASCII letters,
+  digits, or `-`) with `InvalidArgument`; `validate(codec)`
+  re-checks the format, then expiry via `SystemTime`
+  (chrono-free), and records every check in an in-memory audit
+  log (`audit_log()`, ids stored masked as first 4 characters +
+  `***`). Malformed license → `InvalidArgument`; expired
+  license → `LicenseRequired`. No network call, no hard-coded
+  key, no bypass.
+- `feat(error): Error::LicenseRequired { codec }` (`error.rs`),
+  mapped to C ABI `CODEC_ERR_LICENSE_REQUIRED = 8`
+  (`crates/codec-whatttttttttttt-c/`); Python, TypeScript,
+  Kotlin, Swift, and Zig bindings map code 8 to their native
+  license-required error.
+- `feat(hw): hardware path for licensed codecs`. New `hw.rs`:
+  traits `HardwareDecoder` / `HardwareEncoder` plus
+  `StubHardwareDecoder` / `StubHardwareEncoder`, opened with a
+  `LicenseContext`. The stubs call no real hardware API: a
+  successful decode returns a 0×0 frame, a successful encode
+  returns an empty packet. `licensed_software_path_error` and
+  `licensed_feature_enabled` keep the two failure modes apart:
+  feature off → `Unsupported`, feature on without a valid
+  license → `LicenseRequired`.
+- `feat(frame): Codec::Avc and Codec::Hevc`. The software
+  `Decoder` and `Encoder` refuse both outright and never
+  decode/encode them in software. No `Codec::Aac` variant was
+  added (the hardware path has no AAC route yet); the
+  `licensed-aac` feature is declared in advance in the core
+  `Cargo.toml`. Both features (`licensed-avc-hevc`,
+  `licensed-aac`) are off by default (`default = []`).
+- `feat(resolution): AV1 level and VP9 profile frame-size
+  checks`. New `resolution.rs`: `FrameSize` (non-zero sides,
+  at most `MAX_WIDTH` / `MAX_HEIGHT` 8192), `Av1Level` with the
+  14 defined levels of AV1 spec Annex A §10.3,
+  `validate_av1_frame` / `validate_av1_sequence_header` /
+  `minimum_av1_level`, `Vp9ProfileLimits` +
+  `validate_vp9_frame` / `validate_vp9_frame_header` (VP9 spec
+  v0.6 has no level system: profiles 0–3 constrain bit depth
+  and chroma only, frame size is bounded by the library 8192
+  limit), and `suggest_av1` / `suggest_vp9` returning
+  `EncodingSuggestion { bitrate_kbps_min, bitrate_kbps_max,
+  crf }` — suggestions from pixel count, not spec values.
+  AV1 level 5.2 (`seq_level_idx` 14) has
+  `max_display_rate = None`: its display rate is still
+  unverified against the spec table, so only its size caps are
+  checked — cần xác minh.
+- `feat(frame_pool): reusable decoded-frame pool`. New
+  `frame_pool.rs`: `FramePool` (`checkout` / `checkin`,
+  `FramePoolStats`), `frame_bytes`, `plane_bytes`,
+  `bytes_per_sample`. An 8K YUV420 8-bit frame is 49,766,400
+  bytes (~47.5 MiB) and fits the 64 MiB per-call cap; the same
+  frame at 10-bit is 99,532,800 bytes (~94.9 MiB) and the pool
+  deliberately returns `AllocationLimit` instead of raising the
+  cap — see `docs/LIMITS.md`.
+- `feat(scaler): real frame scaling`. New `scaler.rs`:
+  `ScaleFilter::{Bilinear, Bicubic, Lanczos3}` and
+  `scale_frame`, all three implemented for real (Lanczos-3 is
+  sinc×sinc, 6-tap, with the kernel widened on downscale
+  against aliasing). Chroma planes scale at half resolution;
+  colour space, range, and timestamp carry over.
+- `feat(quality): Lossless / Hi-Res Lossless labels`. New
+  `quality.rs`: `QualityParams { lossless, bits_per_sample,
+  sample_rate }`, `classify_quality() ->
+  Option<QualityLabel::{Lossless, HiResLossless}>`. Lossless is
+  lossless at most 16-bit / 48 kHz; Hi-Res Lossless is lossless
+  above that, at most 24-bit / 192 kHz; anything else (lossy,
+  or beyond 24-bit / 192 kHz) is `None`. The labels are
+  commercial labels computed from measured parameters, not
+  formats and not codec names.
+- `feat(dither): TPDF dither and noise shaping`. New
+  `dither.rs`: `DitherOptions { dither, noise_shaping, seed }`,
+  `quantize_i24_to_i16`, `quantize_f32_to_i16` (via the 24-bit
+  path). TPDF noise from a seeded xorshift64 written here (no
+  `rand` dependency; equal seeds give equal output); noise
+  shaping is first-order error feedback. `pcm.rs` gains
+  `PcmFormat::I32` with bit-exact `decode_i32_samples` /
+  `encode_i32_samples` (the f32 path rounds i32 to 24
+  significant bits, so it cannot carry i32 exactly);
+  `wav_header.rs` maps WAV tag (1, 32) to `I32`.
+- `feat(bench): 8K scale + pool benchmark in
+  `crates/codec-whatttttttttttt-core/examples/bench.rs`
+  (manual run: `cargo run --release
+  --example bench`; the CI rust job does not run benchmarks).
+- `docs: new NOTICE` (license-gate and patent-status notes,
+  including MP3 "cần xác minh" and the ALAC plan for the next
+  phase), `docs/DESIGN.md` and `docs/LIMITS.md` updated for
+  the modules above, and `README.md` updated briefly.
+- Demux behaviour is unchanged in this round: MP4/Matroska
+  still reject AVC/HEVC/AAC tracks with `Unsupported` — there
+  is no passthrough behind the gate yet, pending a decision.
+
+### Next phase (2026-11-08/09) — passthrough, MP3/AAC/ALAC decode, bitrate, resampler, DSD
+
+Hoàng confirmed 2026-11-08 22:24: passthrough AVC/HEVC/AAC
+after the license gate is allowed; the 64 MiB cap stays
+(not raised for 8K 10-bit). No H.264/H.265 software codec was
+written — passthrough only demuxes the packets and hands them
+to the hardware path.
+
+- `feat(passthrough): AVC/HEVC/AAC passthrough behind the
+  license gate`. MP4 `avc1`/`hev1`/`mp4a` and Matroska
+  `V_MPEG4/ISO/AVC`, `V_MPEGH/ISO/HEVC`, `A_AAC` sample entries
+  are parsed; `codec_private` (`avcC`/`hvcC`/`esds`) is kept.
+  The demuxer holds an `Option<LicenseContext>` and
+  `set_license_context` validates eagerly: parsing succeeds
+  without a license (tracks are listed), only `next_packet`
+  refuses licensed packets — `LicenseRequired` with the
+  features on, `Unsupported` with them off. `hw::passthrough_allowed`
+  is the gate check.
+- `feat(mpeg-ts): MPEG-TS demux/mux (ISO/IEC 13818-1)`.
+  `mpeg_ts.rs`: 188-byte packets, PAT/PMT, PES assembly, one
+  audio PES holds many ADTS frames (ffmpeg packs ~15 per PES).
+  Limitation: 1 packet/PES handling as documented in
+  `docs/LIMITS.md`.
+- `feat(adts): ADTS demux/mux + CRC-16`. `adts_frame.rs` owns
+  the single ADTS header parser in the crate (header parse,
+  `verify_adts_frame`, `AdtsDemuxer`, `write_adts_frame`,
+  CRC-16 polynomial `0x8005`, init `0xFFFF`). The AAC
+  decoder's old duplicated header parser was removed; its
+  `aac_frame::parse_adts_header` is now a thin wrapper that
+  adds the LC-only check, the channel-count mapping, and the
+  frame-fits-in-input check (see `docs/LIMITS.md` for the
+  deliberate behaviour differences).
+- `feat(aiff): AIFF/AIFF-C demux/mux`. `aiff_chunk.rs`:
+  COMM/SSND/MARK/COMT/FVER, AIFF-C `NONE`/`sowt` only.
+- `feat(id3): ID3v1/v2 read/write`. `id3_tag.rs`: v2.3/v2.4
+  frames, v1 tags. The v2 extended header is assumed per
+  `docs/LIMITS.md`.
+- `feat(mp4-tag): MP4 `meta`/`ilst` tags`. `mp4_tag.rs`:
+  text, integer, track/disk number, genre (ID3v1 index + 1),
+  cover art kept raw.
+- `feat(vorbis-comment): Vorbis comment read/write`.
+  `vorbis_comment.rs`: strict parse, lenient fallback as
+  documented in `docs/LIMITS.md`.
+- `feat(mp3): MP3 Layer III decode`. `mp3_frame.rs`,
+  `mp3_huffman.rs`, `mp3_synth.rs`, `mp3_tables.rs` (tables
+  from minimp3, CC0). Full ISO/IEC 11172-4 compliance:
+  measured RMS ~1.8e-7–2.7e-7, max ~1.1e-6–1.9e-6 against
+  ffmpeg/libmp3lame fixtures, bounds RMS < 8.80967e-06 and
+  max <= 6.10352e-05. Layer I/II decode is `Unsupported`;
+  intensity stereo has no verifying fixture yet.
+- `feat(aac): AAC-LC decode behind `licensed-aac``.
+  `aac_frame.rs`, `aac_huffman.rs`, `aac_tables.rs`: raw-data-block
+  decode, MS stereo, TNS, PNS (LCG, ffmpeg seed `0x1f2e3d4c`).
+  Feature off → `Unsupported`; no/thin/expired license →
+  `LicenseRequired`; valid license → real decode. Measured
+  against ffmpeg: worst max abs 7.9e-5 / RMS 3.0e-6, bounds
+  max abs <= 2.0e-3 / RMS <= 5.0e-4. CCE is unverified and
+  `gain_element_scale` is ignored (see `docs/LIMITS.md`); TNS
+  has no measured fixture yet; HE-AAC/SBR/LTP are
+  `Unsupported`.
+- `feat(alac): ALAC decode, bit-exact vs ffmpeg`.
+  `alac_frame.rs`, `alac_predictor.rs`: 16-bit and 24-bit
+  (from s32 input), mono/stereo, noise/ramp fixtures. No
+  license gate. CCE/PCE are `Unsupported`.
+- `feat(bitrate): `BitrateMode` validation`. `bitrate.rs`:
+  `Cbr`, `Vbr(u8 0..=9, 0 is best per LAME -V)`, `Abr`;
+  per-codec validation; Opus only at 8/12/16/24/48 kHz.
+- `feat(resampler): windowed-sinc polyphase resampler`.
+  `polyphase.rs`: Kaiser window (A = 90 dB), 128 taps/phase,
+  2048-tap prototype floor. Measured: THD+N −115..−117 dB,
+  ripple 0.0001 dB, aliasing −117..−159 dB. `resample.rs`
+  gains `ResampleMethod` (linear stays the default for
+  callers that accept interpolation error).
+- `feat(dsd): DSF/DFF demux, DSD to PCM decimation, DoP`.
+  `dsd_stream.rs`, `dsd_decimator.rs`, `dsd_coefficients.rs`,
+  `dop.rs`: block-streamed DSF (LSB-first) / DFF (MSB-first),
+  4 levels, decimation FIR Blackman 32 taps/output, DoP
+  DSD64/128 at 176.4/352.8 kHz (DSD256/512 `Unsupported`).
+  Fixtures are synthetic first-order sigma-delta (ffmpeg has
+  no PCM-to-DSD encoder); DFF cross-checked against ffmpeg
+  decode (exactly 0.5 amplitude), DSF against the Sony spec
+  text (ffmpeg's DSF path returns noise).
+- `feat(tests): audio matrix + fixture inventory`.
+  `tests/audio_matrix.rs`: lossless bit-exact rows (WAV/FLAC/
+  ALAC), sample matrix §6 round-trips (16-bit 44.1/48/96/192
+  kHz, 24-bit 16/48/96/192 kHz via FLAC/PCM encoders),
+  lossy bitrate rows (MP3/AAC 64/96/128/320 kbps under the
+  established thresholds), Vorbis at 2x the measured loss,
+  Opus `Unsupported` for CELT/SILK, and encode-refusal rows.
+  `tests/data/README.md` inventories every new fixture with
+  its origin and generation method.
+- `feat(fuzz): four new targets`. `fuzz_mp3.rs` (MP3 header
+  parse + frame decode), `fuzz_adts.rs` (header/verify/demux),
+  `fuzz_dsf.rs` / `fuzz_dff.rs` (chunk parse + decimation).
+  `fuzz_mp4.rs` extended: drives the common `Demuxer` too,
+  and the seed corpus adds the passthrough fixtures so
+  mutations start from valid `avc1`/`hev1`/`mp4a` `stsd`
+  structures.
+- `fix(polyphase): DC test trimmed the wrong transient`.
+  The test trimmed the group delay (~64 input frames) but the
+  zero-padding edge transient lasts the whole prototype
+  window in output frames — `(prototype_len - 1) / down`,
+  about 139 frames here — with Gibbs ringing above the 1e-4
+  threshold until then (worst deviation 0.0079 at output
+  frame 78, within 4e-7 by frame 139). The test now trims
+  `edge_transient_in_output_frames() + 10`; the 1e-4 threshold
+  is unchanged. The code was correct; the test's expectation
+  was wrong (it also mixed units: input frames applied to
+  output frames). `delay_in_input_frames` is now documented
+  as the group delay, not the transient length.
+- `fix(clippy): test-target lints`. The four lib errors
+  (`mp4_tag` too-many-lines, doc-markdown, assert-is-empty;
+  `aiff_chunk` match-same-arms) plus the test-target lints
+  they were hiding (dead code behind the `licensed-aac` gate,
+  `trivially-copy-pass-by-ref`, casts, `similar-names`,
+  `needless-lifetimes`, `missing-panics-doc`, `must-use`,
+  doc lazy continuation). Fixed for real; the only `allow`s
+  are justified per-item with a `reason` comment.
+- `fix(encoder): stale MP3 error message`. `encoder.rs`
+  said "mp3 has no Codec variant yet"; MP3 encoding is
+  `Unsupported` because there is no Layer III encoder, not
+  because the variant is missing.
+- `fix(adts): duplicated ADTS header parser removed`.
+  `aac_frame.rs` no longer parses ADTS headers bit by bit;
+  it delegates to `adts_frame::parse_adts_header` (see the
+  `feat(adts)` entry above).
+
+### Final round (2026-11-09) — small items, encoders, PCM→DSD, CELT, VP9, AV1
+
+- `feat(mp3-ts): MP3 in MPEG-TS`. `mpeg_ts.rs` maps stream
+  types 0x03/0x04 to `Codec::Mp3`; a TS file carrying MP3
+  decodes (40 frames, RMS 3.328e-8, max 2.682e-7 vs ffmpeg,
+  within ISO/IEC 11172-4).
+- `feat(vorbis): floor type 0 packet decode`.
+  `vorbis_setup.rs` / `vorbis_packet.rs`: header parse +
+  packet decode; verified on a synthetic stream only (no real
+  floor-0 file exists — libvorbis has not emitted floor 0
+  since beta 4): header parse + packet decode + hand-computed
+  math, max diff 0 vs an independent f64 reference.
+- `feat(flac): 20/24-bit and >2-channel decode and encode`.
+  `flac_frame.rs`: subframe/sample-width extension; decode
+  verified max diff 0 vs ffmpeg (24-bit stereo, 5.1);
+  encoder `encode_flac_frame_wide` /
+  `FlacEncoder::encode_i32` / `with_bits_per_sample`
+  (16/20/24), round-trip max diff 0, ffmpeg cross-check 0.0;
+  32-bit encode intentionally not done. `Encoder` exposes it
+  via `EncoderConfig.bits_per_sample` (16/20/24, default 16).
+- `feat(mp3-encode): MP3 Layer III CBR encode`.
+  `mp3_encode.rs`: `Mp3Encoder` (MPEG-1 64/96/128/320 kbps;
+  MPEG-2/2.5 64/96/128, 320 rejected per ISO/IEC 11172-3
+  Table B.1); joint 4-granule window solved by conjugate
+  gradient; Huffman encode from the decode trees (canonical,
+  §2.4.3); long blocks only, plain stereo, no bit reservoir.
+  One frame of encoder delay: `encode()` returns the previous
+  frame, first calls return silent priming frames, the tail
+  only on `flush()`. Round-trip RMS ~0.005–0.007; ffmpeg
+  cross-check RMS/max 0.0000. VBR/ABR `Unsupported` by design.
+- `feat(aac-encode): AAC-LC encode behind the gate`.
+  `aac_encode.rs`: `AacEncoder` (MDCT + sine window 1024,
+  quantizer inverting the decoder's dequant, one scalefactor
+  per frame, codebook pair 5/7/9/11 chosen by exact bit cost,
+  SCE/CPE + ADTS via `write_adts_frame`). CBR 64/96/128/320,
+  ABR, VBR (quality 0..=9 maps to budget 320→64 kbps). Gate:
+  feature off → `Unsupported` regardless of license; feature
+  on without/expired license → `LicenseRequired`;
+  `Encoder::new` fails at construction when the gate is
+  closed (like `Decoder::from_aac_config`), via the new
+  `EncoderConfig.license`. Round-trip vs source: stereo 128k
+  RMS 5.1e-4, mono 8k RMS 3.9e-4; our decoder vs ffmpeg
+  decode of the same stream: 0.000000 / 0.000000. No bit
+  reservoir: frames can be smaller than the CBR budget;
+  `buffer_fullness` stays 0x7FF (VBR). HE-AAC/SBR
+  `Unsupported`.
+- `feat(alac-encode): ALAC lossless encode`.
+  `alac_encode.rs`: `AlacEncoder` (16-bit and 24-bit,
+  mono/stereo/multi-channel 1–8, frames 1–4096); round-trip
+  bit-exact via the library decoder and ffmpeg decode of the
+  `.m4a`. 20/32-bit encode intentionally unsupported.
+  `Encoder` maps `pcm_format` I16→16 / I24→24 and rejects
+  I32/F32.
+- `feat(dsd-encode): PCM→DSD delta-sigma modulation`.
+  `dsd_modulator.rs`: CIFB order-5 modulator, NTF
+  `((1−z⁻¹)/(1−0.85·z⁻¹))⁵`, max |NTF| ≈ 1.47 (Lee rule),
+  feedback coefficients computed in code; 48 kHz family via
+  rational interpolation; streaming `feed()` / `flush()`;
+  `write_dsf` / `write_dff` (DSF LSB-first, DFF MSB-first via
+  `reverse_bit_order`). DSD64/128/256/512. Round-trip via
+  `DsdDecimator` passes all 4 levels; THD+N −84.9 dB (sine
+  1 kHz, amp 0.5, DSD64→44.1k); ffmpeg cross-check on DFF:
+  amplitude 0.4998/0.4995 vs target 0.5. Benchmarks (VM,
+  release): DSD128 0.39x realtime, DSD512 0.12x realtime —
+  not realtime. STF droop ≈0.87 (−1.2 dB) at 18 kHz
+  documented, unfixed. DSF 1–7 channels, DFF mono/stereo
+  only; input clamp ±0.75. `Encoder` exposes it via
+  `EncoderConfig.dsd_level` (default DSD64); packets hold raw
+  DSD bytes in DSF layout.
+- `feat(celt): Opus CELT sample reconstruction`.
+  `celt_reconstruct.rs`: full pipeline in f32 ported from RFC
+  6716 Appendix A reference (Opus 1.0): band-energy decode,
+  TF resolution, bit allocation, PVQ shape decode (CWRS +
+  exp rotation + stereo merge), denormalisation,
+  anti-collapse, inverse MDCT + overlap-add, comb-filter
+  postfilter, de-emphasis; 22 tables, each with provenance in
+  a comment at the table. Verified vs ffmpeg on CELT-only
+  fullband stereo 20 ms frames: sine RMS 1.330e-05, noise
+  3.318e-06, music 6.778e-06, speech 3.362e-06 (thresholds
+  RMS < 1e-4, max < 1e-3). SILK/Hybrid stay `Unsupported`.
+  Two bugs found and fixed during verification: comb-filter
+  double-application (tail filtered twice, frame RMS blew up
+  0.35 → 150 by frame 29) and the RNG seed (the range
+  decoder's `rng` must carry into the next frame — the first
+  approximation failed noise at RMS 0.162). `Decoder`
+  now decodes CELT frames via `CeltDecoder` (built in
+  `from_opus_head`); silence frames decode through the same
+  path.
+- `feat(vp9): VP9 reconstruction — keyframes bit-exact, inter
+  frames not done`. `vp9_token.rs` (default prob tables
+  verified 1728/1728 exact vs libvpx `vp9_entropy.c`; scan
+  tables 10/10 exact vs `vp9_scan.c`),
+  `vp9_predict.rs` (all 10 intra modes, inter prediction +
+  motion compensation, MV prediction, segmentation),
+  `vp9_loopfilter.rs` (§8.8), `vp9_reconstruct.rs` (pipeline
+  + `Vp9ReconstructionState`). Keyframes bit-exact
+  (max_diff 0) on every fixture (64×64, 320×128, 320×240
+  mandel, testsrc2, lossless WHT path, superframe,
+  show-existing). Bug fixed this round: TX_32X32 must use
+  DCT_DCT regardless of mode (spec §6.4.25); the old code
+  used `MODE2TXFM[y_mode]` for every TX size, corrupting
+  32×32 V_PRED blocks and, through intra prediction, the rest
+  of the frame. Inter frames are NOT done: the first inter
+  frame already differs (mandel 320×240 frame 1: max 14,
+  9,520 diffs) and errors compound through the reference
+  chain; `Decoder` therefore returns `Unsupported` for inter
+  frames instead of wrong pixels (the 7 inter tests are
+  `#[ignore]`d with the reason recorded). Tile rows untested
+  (ffmpeg/libvpx ignores `-tile-rows`).
+- `feat(av1): AV1 tile decode + intra reconstruction, no
+  pixels yet`. `av1_tile.rs` (partition walk + intra mode /
+  palette / TX-size decode, verified end-to-end on 64×64:
+  leaf blocks tile the frame exactly), `av1_intra.rs` (DC /
+  V / H / Paeth / smooth / directional / filter-intra /
+  palette / CFL + inverse transforms + dequant, 32 unit
+  tests), `av1_reconstruct.rs` (pipeline + subset gating).
+  No pixels are produced: the coefficient CDF tables (~15k
+  values, spec §9.3) are the blocker, so the pipeline
+  returns `Unsupported(COEFFICIENT_GAP)` after the tile walk
+  and the pixel test is `#[ignore]`d. `Decoder::decode_av1`
+  wires the pipeline (OBU iteration + sequence header).
+  Open: ADST8/16 discrepancy (spec-factorization vs textbook
+  DST-VII; the spec is kept, the model test is ignored);
+  loop filter / CDEF / loop restoration not implemented.
+- `fix(av1): tile-area parser bug`. `parse_tile_info` in
+  `av1_frame.rs` used `MAX_TILE_AREA_SB = 4096` with
+  `>> (2 * sb_size)`, giving 1 (64-SB) / 0 (128-SB) and
+  forcing extra tiles, desyncing the 320×240/640×480 headers
+  (`InvalidData: av1 tile group range is outside the frame`).
+  Per spec §3 / §5.11 the constant is `MAX_TILE_AREA =
+  4096*2304` luma samples, i.e. 2304 SB (64×64) / 576 SB
+  (128×128) via `>> (2 * (sb_size - 6))`; verified against
+  ffmpeg `trace_headers` + dav1d (1 tile). 320×240/640×480
+  now parse, but their tile tests stay `#[ignore]`d: libaom
+  sets `allow_intrabc = 1` and a block uses intra block copy,
+  which is not implemented.
+- `fix(celt): debug-only overflow panic in the pulse-cache
+  index`. `quant_band` computed the cache index as `(lm as
+  usize + 1) * NB_EBANDS + band`; with `lm == -1` (short
+  blocks) the cast wraps to `usize::MAX` and `+ 1` overflows
+  in debug (release wrapped to 0 by accident, so release
+  tests passed while debug panicked at
+  `celt_reconstruct.rs:2639`). Fixed with a checked
+  `pulse_cache_index` helper (i64 math, `.get()` →
+  `InvalidData`); same-class fixes in `bits2pulses` /
+  `pulses2bits` and a `saturating_sub` in `quant_all_bands`.
+  All 6 CELT tests now pass in debug and release.
+- `feat(decoder/encoder): wiring`. `Decoder` now decodes
+  Opus CELT, VP9 keyframes, and AV1 (coefficient-gap
+  `Unsupported`); `Encoder` now encodes MP3 (CBR), AAC-LC
+  (gated), ALAC (16/24-bit), DSD (raw DSF-layout bytes), and
+  FLAC at 16/20/24-bit (`bits_per_sample`);
+  `Encoder::flush` drains the MP3 tail queue and the DSD
+  tail; `BitrateCodec::from_codec` now maps `Codec::Mp3`
+  (the "MP3 has no Codec variant" note was stale).
+- `chore(verify): clippy pedantic + fmt clean in both feature
+  states`. VP9 files rewritten to 0 pedantic lints (iterators,
+  renames, targeted `#[allow]`s with WHY comments; no decode
+  logic changed — keyframes still bit-exact); `Encoder`
+  fields renamed (`flac_encoder` → `flac`, `mp3_encoder` →
+  `mp3`, `aac_encoder` → `aac_lc`, `alac_encoder` → `alac`)
+  for `struct_field_names` / `similar_names`, plus a
+  `too_many_lines` allow on the dispatch `encode()`; test
+  helpers in `aac_encode` / `alac_encode` / `dsd_modulate`
+  fixed the same way (real fixes where cheap, `#[allow]`
+  with WHY where the values are provably bounded). Restored
+  the `aac_encode` imports a `clippy --fix` run had removed
+  as "unused" while the `licensed-aac` feature was off
+  (`AacDecoder`, `AdtsDemuxer`, `WavDemuxer`,
+  `aac_frame::parse_adts_header`, `Cursor`), and gated the
+  `AudioFrame` import with the feature. The AV1 320×240 /
+  640×480 tile-test docs now record the real blocker (intra
+  block copy, not the fixed parser bug).
+
+Encode status after this round: PCM and FLAC (16/20/24-bit)
+encode; MP3 CBR encodes (VBR/ABR `Unsupported`); AAC-LC
+encodes behind the license gate (feature off →
+`Unsupported`, no/expired license → `LicenseRequired` at
+`Encoder` construction); ALAC 16/24-bit encodes bit-exactly
+(20/32-bit `Unsupported`); DSD encodes via delta-sigma
+(DSF-layout raw bytes; DSF/DFF containers via `write_dsf` /
+`write_dff`); Opus still needs CELT/SILK encoders; Vorbis
+still needs codebook/floor/residue encoders; AV1/VP9 still
+need full video encoders.
+
 ### Added
 
 - Phase 0: Cargo workspace (`codec-whatttttttttttt-core`,
@@ -438,22 +851,27 @@ Semantic Versioning.
   rate; the caller converts with the codec's sample rate.
 - FLAC decode has no seeking and no streaming; the whole file is
   bounded by `MAX_FLAC_FILE_BYTES` (512 MiB).
-- AV1 is parser-only: OBU, sequence header, frame header, and
-  tile-group framing parse and match ffmpeg's `trace_headers`
-  output, but no pixels are reconstructed. `Decoder::decode` for
-  `Codec::Av1` returns `Unsupported`. The subset is profile 0,
-  8-bit, YUV420, no film grain; multi-tile frames are framed but
-  not decoded, and no multi-tile test vector exists yet. See
-  `docs/LIMITS.md`.
-- VP9 is parser-only (Phase 8): frame headers, superframe
-  indexes, and tile framing parse and match ffmpeg's
-  `trace_headers` output and libvpx behaviour, but no pixels are
-  reconstructed. `Decoder::decode` for `Codec::Vp9` returns
-  `Unsupported`. The subset is profile 0, 8-bit, YUV420; the
-  compressed header's updated probability values are not
-  tracked (the spec's default probability tables are not
-  ported). VP9 packets demux from WebM and MP4, and the CLI
-  prints `vpcC` fields and VP90 IVF frame headers.
+- AV1 reconstruction is partial (final round): tile decode and
+  intra reconstruction exist (partition walk, intra modes,
+  inverse transforms, dequant), but no pixels are produced —
+  the coefficient CDF tables (spec §9.3, ~15k values) are
+  missing, so the pipeline returns
+  `Unsupported(COEFFICIENT_GAP)`. Intra block copy is not
+  implemented (the 320×240/640×480 fixtures use it). The
+  ADST8/16 spec-factorization discrepancy is open (see
+  `docs/LIMITS.md`). The subset is still profile 0, 8-bit,
+  YUV420, no film grain; multi-tile frames are framed and the
+  320×240/640×480 headers now parse (tile-area bug fixed),
+  but the tiles are not decoded to pixels.
+- VP9 reconstruction is partial (final round): keyframes
+  decode bit-exactly (max_diff 0 on every fixture), but inter
+  frames are not pixel-correct — the first inter frame
+  already differs and errors compound — so `Decoder::decode`
+  for `Codec::Vp9` returns `Unsupported` for inter frames.
+  The subset is profile 0, 8-bit, YUV420; the default
+  probability tables are now ported and verified against
+  libvpx (1728/1728 coef probs, 10/10 scan tables). Tile rows
+  are untested (ffmpeg/libvpx ignores `-tile-rows`).
 - WebM/MP4 demux: the Opus and Vorbis pre-skips are not applied
   by the demuxer (raw container timestamps are returned); the MP4
   edit list is parsed but not applied to timestamps;
@@ -461,17 +879,14 @@ Semantic Versioning.
   `CodecState` are skipped, not applied. FLAC in MP4 is parsed but
   unverified (ffmpeg cannot produce it, so no test vector
   exists). Seeking without Cues falls back to scanning packets.
-- Opus is partial: CELT sample reconstruction (coarse/fine energy,
-  bit allocation, PVQ, inverse MDCT, post-filter, de-emphasis) and
-  SILK decode are not implemented. The CELT allocation and PVQ
-  tables exist only inside the reference C source, which RFC 6716
-  Appendix A ships as a base64-encoded gzipped tarball that cannot
-  be extracted from the specification text; porting them from the
-  reference source is follow-up work. CELT silence frames decode
-  to silence, and `conceal_loss()` returns silence PLC. Channel
-  mapping families 1 and 255 return `Unsupported`.
-- Vorbis floor type 0 parses its header but packet decode returns
-  `Unsupported`; floor type 1 is fully implemented. Vorbis has no
-  PLC; a lost packet is skipped and the next overlap-add uses the
-  previous tail.
+- Opus is partial: CELT sample reconstruction is now
+  implemented and verified vs ffmpeg (RMS ~1e-5 on CELT-only
+  fullband stereo 20 ms frames); SILK decode is not
+  implemented and returns `Unsupported`. CELT silence frames
+  decode to silence, and `conceal_loss()` returns silence PLC.
+  Channel mapping families 1 and 255 return `Unsupported`.
+- Vorbis floor type 0 now decodes (verified on a synthetic
+  stream only — no real floor-0 file exists); floor type 1
+  is fully implemented. Vorbis has no PLC; a lost packet is
+  skipped and the next overlap-add uses the previous tail.
 - No FFI crate or bindings yet (Phase 10).
